@@ -13,11 +13,7 @@ impl Tray {
     pub fn new(icon: tray_icon::Icon) -> Self {
         std::thread::spawn(move || {
             gtk::init().unwrap();
-            let _tray_icon = TrayIconBuilder::new()
-                .with_menu(Box::new(Menu::new()))
-                .with_icon(icon)
-                .build()
-                .unwrap();
+            let _tray_icon = TrayIconBuilder::new().with_menu(Box::new(Menu::new())).with_icon(icon).build().unwrap();
             gtk::main();
         });
         Self

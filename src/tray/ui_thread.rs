@@ -29,10 +29,7 @@ impl Tray {
         let Some(icon) = self.icon.borrow_mut().take() else {
             return;
         };
-        let tray_icon = TrayIconBuilder::new()
-            .with_icon(icon)
-            .build()
-            .expect("Failed to create tray icon");
+        let tray_icon = TrayIconBuilder::new().with_icon(icon).build().expect("Failed to create tray icon");
         self.handle.borrow_mut().replace(tray_icon);
     }
 }
