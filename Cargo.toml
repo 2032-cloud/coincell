@@ -1,0 +1,12 @@
+[package]
+name = "coincell"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+display-info = "0.5.9"
+eframe = "0.36.1"
+image = "0.25.10"
+interprocess = "2.4.2"
+tray-icon = "0.24.2"
+anyhow = "*"
