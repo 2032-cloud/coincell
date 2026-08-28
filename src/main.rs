@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod auth;
+mod config;
 mod constants;
 mod ipc;
 mod placement;
@@ -19,7 +21,9 @@ fn main() -> anyhow::Result<()> {
         Instance::Secondary => return Ok(()),
     };
 
-    // Kept alive for the whole run: on Windows/macOS this owns the tray icon.
+    config::Config::init();
+    config::OauthSpec::init();
+
     let tray = Rc::new(tray::Tray::new(tray::load_icon()));
     let tray_for_ui = Rc::clone(&tray);
 
@@ -29,9 +33,9 @@ fn main() -> anyhow::Result<()> {
             viewport: placement::viewport(),
             ..Default::default()
         },
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             tray_for_ui.attach();
-            Ok(Box::new(App::new(wake_rx)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), wake_rx)))
         }),
     )?;
 

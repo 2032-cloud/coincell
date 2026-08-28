@@ -1,11 +1,8 @@
-//! Window geometry: where the app sits on screen and how big it is.
+//! Window geometry
 
 use crate::constants::*;
 use eframe::egui::ViewportBuilder;
 
-/// Build the viewport for the main window: a fixed-size, undecorated,
-/// always-on-top window anchored to the bottom-right corner of the primary
-/// display.
 pub fn viewport() -> ViewportBuilder {
     let displays = display_info::DisplayInfo::all().expect("Could not retrieve display information");
     let display = displays.iter().find(|display| display.is_primary).or_else(|| displays.first()).expect("No displays detected");
