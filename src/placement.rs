@@ -17,10 +17,5 @@ pub fn viewport() -> ViewportBuilder {
 
     let app_position: (f32, f32) = (display_width - SCREEN_MARGIN - app_width + display_x, display_height - SCREEN_MARGIN - app_height + display_y);
 
-    ViewportBuilder::default()
-        .with_resizable(false)
-        .with_position(app_position)
-        .with_inner_size((app_width, app_height))
-        .with_always_on_top()
-        .with_decorations(false)
+    ViewportBuilder::default().with_resizable(false).with_position(app_position).with_inner_size((app_width, app_height)).with_always_on_top().with_decorations(false)
 }

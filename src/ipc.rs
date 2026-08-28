@@ -12,11 +12,7 @@ pub enum Instance {
 }
 
 pub fn acquire() -> anyhow::Result<Instance> {
-    let name = if GenericNamespaced::is_supported() {
-        IPC_NAME.to_ns_name::<GenericNamespaced>()?
-    } else {
-        format!("/tmp/{IPC_NAME}.sock").to_fs_name::<GenericFilePath>()?
-    };
+    let name = if GenericNamespaced::is_supported() { IPC_NAME.to_ns_name::<GenericNamespaced>()? } else { format!("/tmp/{IPC_NAME}.sock").to_fs_name::<GenericFilePath>()? };
 
     let listener = match ListenerOptions::new().name(name.borrow()).create_sync() {
         Ok(listener) => listener,

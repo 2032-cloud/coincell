@@ -1,0 +1,10 @@
+# Project formatting. Committed so every checkout (and the pre-commit hook)
+# formats the same way regardless of a developer's global ~/.rustfmt.toml.
+#
+# This codebase is written wide: single-line structs, calls and match arms are
+# the norm. `max_width = 200` plus `use_small_heuristics = "Max"` (which lets the
+# per-construct width limits use the full line rather than their small defaults)
+# keeps rustfmt from exploding those onto many lines.
+
+max_width = 200
+use_small_heuristics = "Max"

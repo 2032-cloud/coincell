@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-28",
+  "identity": {
+    "name": "2032",
+    "short_name": "2032",
+    "tagline": "Retro game save sync",
+    "homepage_url": "https://2032.cloud",
+    "docs_url": "https://cr.2032.cloud/docs",
+    "attribution_text": "Saves synced with 2032"
+  },
+  "colors": {
+    "default_scheme": "dark",
+    "light": {
+      "bg": "#f0e0d6",
+      "bg_elevated": "#f8efe8",
+      "text": "#800000",
+      "text_muted": "#9c5c50",
+      "border": "#d8c3b2",
+      "accent": "#1c71d8",
+      "accent_hover": "#155cb3",
+      "danger": "#b32828",
+      "on_accent": "#ffffff",
+      "focus_ring": "#1c71d8"
+    },
+    "dark": {
+      "bg": "#282a2e",
+      "bg_elevated": "#31343a",
+      "text": "#c5c8c6",
+      "text_muted": "#8b8f93",
+      "border": "#3c4046",
+      "accent": "#1c71d8",
+      "accent_hover": "#3d8ae5",
+      "danger": "#e06c75",
+      "on_accent": "#ffffff",
+      "focus_ring": "#1c71d8"
+    }
+  },
+  "typography": {
+    "font_family": "Inter, system-ui, Avenir, Helvetica, Arial, sans-serif",
+    "font_source_url": null,
+    "weights": [400, 500, 700]
+  },
+  "assets": [],
+  "usage": {
+    "guidelines_url": null,
+    "notes": "Use the 2032 name and logo to link back to 2032. Don't recolor the logo or imply endorsement."
+  }
+}

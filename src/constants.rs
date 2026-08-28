@@ -2,7 +2,6 @@ use std::path::Path;
 
 use directories::ProjectDirs;
 use lazy_static::lazy_static;
-use reqwest::blocking::Client;
 
 // MISC CONSTANTS
 pub const APP_NAME: &str = "CoinCell";
@@ -24,5 +23,37 @@ lazy_static! {
     pub static ref PROJECT_DIRS: ProjectDirs = directories::ProjectDirs::from("com", COMPANY_NAME, APP_NAME).expect("Unable to calculate project dirs");
     pub static ref CONFIG_DIR: &'static Path = PROJECT_DIRS.config_dir();
     pub static ref DATA_DIR: &'static Path = PROJECT_DIRS.data_dir();
-    pub static ref API_CLIENT: Client = Client::new();
+
+    // IDENTITY — resolved once at startup. Empty string means "couldn't tell".
+    pub static ref USERNAME: String = whoami::username().unwrap_or_default();
+    pub static ref DEVICE_NAME: String = whoami::devicename().unwrap_or_default();
+    pub static ref PLATFORM: String = whoami::platform().to_string();
+    /// The session name this client reports at bootstrap, e.g.
+    /// `CoinCell - ethan@tower - Windows`. Degrades a piece at a time rather than
+    /// showing a placeholder: no hostname -> `CoinCell - ethan - Windows`,
+    /// no username either -> `CoinCell - Windows`.
+    pub static ref CLIENT_NAME: String = build_client_name();
+}
+
+fn build_client_name() -> String {
+    let (user, host) = (USERNAME.as_str(), DEVICE_NAME.as_str());
+    let who = match (user.is_empty(), host.is_empty()) {
+        (false, false) => format!("{user}@{host}"),
+        (false, true) => user.to_owned(),
+        (true, false) => host.to_owned(),
+        (true, true) => String::new(),
+    };
+    if who.is_empty() { format!("{APP_NAME} - {}", PLATFORM.as_str()) } else { format!("{APP_NAME} - {who} - {}", PLATFORM.as_str()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_name_is_well_formed() {
+        assert!(CLIENT_NAME.starts_with(&format!("{APP_NAME} - ")), "{}", *CLIENT_NAME);
+        assert!(CLIENT_NAME.ends_with(PLATFORM.as_str()), "{}", *CLIENT_NAME);
+        assert!(!PLATFORM.is_empty());
+    }
 }

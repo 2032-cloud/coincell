@@ -11,10 +11,7 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(icon: tray_icon::Icon) -> Self {
-        Self {
-            icon: RefCell::new(Some(icon)),
-            handle: RefCell::new(None),
-        }
+        Self { icon: RefCell::new(Some(icon)), handle: RefCell::new(None) }
     }
 
     pub fn attach(&self) {
