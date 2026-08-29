@@ -256,8 +256,16 @@ impl ConfigApp {
             let r = Config::update(|c| c.startup = s);
             self.note_save(r);
         }
-        ui.add_space(6.0);
         ui.small("OS auto-start registration isn't wired up yet, this records the preference only.");
+
+        ui.add_space(10.0);
+
+        let mut hide_on_blur = Config::get(|c| c.window.hide_on_focus_loss);
+        if ui.checkbox(&mut hide_on_blur, "Hide the window when it loses focus").changed() {
+            let r = Config::update(|c| c.window.hide_on_focus_loss = hide_on_blur);
+            self.note_save(r);
+        }
+        ui.small("The minimise button, Esc, and clicking the tray icon hide it regardless.");
     }
 
     fn notifications(&mut self, ui: &mut egui::Ui) {

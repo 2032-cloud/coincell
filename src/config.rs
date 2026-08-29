@@ -225,8 +225,10 @@ impl Default for Appearance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowRules {
-    /// Auto-minimise a window when it loses focus. The manual minimise button
-    /// and `Esc` work regardless of this.
+    /// Auto-minimise a window when it loses focus. Off by default: it's fiddly
+    /// around transient focus changes, and the `—` button, `Esc`, and the tray
+    /// click are all reliable manual ways to hide now. Those work regardless of
+    /// this.
     pub hide_on_focus_loss: bool,
     /// egui zoom factor. `1.0` is native; clamped to `UI_SCALE_RANGE` on use.
     pub ui_scale: f32,
@@ -234,7 +236,7 @@ pub struct WindowRules {
 
 impl Default for WindowRules {
     fn default() -> Self {
-        Self { hide_on_focus_loss: true, ui_scale: 1.0 }
+        Self { hide_on_focus_loss: false, ui_scale: 1.0 }
     }
 }
 

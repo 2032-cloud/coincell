@@ -23,9 +23,9 @@ history + restore. Not started: the tray menu, versioning, the updater.
 - Watches user-configured local save files (per game), pushes changes up, pulls
   newer versions down.
 - Lives in the tray. Two frameless windows, bottom-right: **Home** (left-click,
-  the per-game list) and **Config** (right-click). They auto-hide on focus loss
-  (unless `[window].hide_on_focus_loss = false`), and always via the header's
-  **—** button or `Esc`.
+  the per-game list) and **Config** (right-click). Hide via the header's **—**
+  button, `Esc`, or the tray click; opt-in auto-hide on focus loss
+  (`[window].hide_on_focus_loss`, default off).
 - Distributed as GitHub Release binaries, pointed to from the website. Self-updates
   from those same releases.
 
@@ -191,7 +191,7 @@ on_session_expired = true
 theme = "account"             # "account" (follow /api/me) | "auto" | "light" | "dark"
 
 [window]
-hide_on_focus_loss = true     # minimize button + Esc always work regardless
+hide_on_focus_loss = false    # opt-in; — button + Esc + tray click always work
 ui_scale = 1.0                 # egui zoom factor, clamped 0.5..=3.0
 
 [updates]
@@ -246,11 +246,13 @@ Rail sections:
    pause-on-metered, and a **Sync now** button (`ConfigOutcome::SyncNow` →
    `SyncEngine::sync_now`), disabled when `enabled` is off. _(No live status line
    yet - the engine emits `EngineEvent::Status` but Home isn't built to show it.)_
-3. **Startup** - launch on login, start hidden. `start_hidden` **is** honoured:
-   `App` starts in `WindowState::Hidden` and `App::reconcile_visibility` (see
-   Window behavior) sends `ViewportCommand::Visible(false)` on the first frames —
-   eframe ignores `ViewportBuilder::with_visible` and force-shows once after the
-   first paint, so re-asserting is what actually keeps it hidden.
+3. **Startup** - launch on login, start hidden, and (a stray `[window]` toggle
+   that fits here better than its own section) **hide the window when it loses
+   focus** = `window.hide_on_focus_loss`. `start_hidden` **is** honoured: `App`
+   starts in `WindowState::Hidden` and `App::reconcile_visibility` (see Window
+   behavior) sends `ViewportCommand::Visible(false)` on the first frames — eframe
+   ignores `ViewportBuilder::with_visible` and force-shows once after the first
+   paint, so re-asserting is what actually keeps it hidden.
    _(Launch-on-login still records the pref only; OS autostart not wired.)_
 4. **Notifications** - master toggle + the four per-event toggles (disabled while
    the master is off). These gate `notice::post` (see Notifications); delivery
@@ -826,8 +828,10 @@ signing key can be generated right before the first real release.
 - **Esc** also minimises - consumed at end-of-frame via `input_mut().consume_key`
   so an open combo / the first-run modal claims it first, and skipped while
   `modal_active`.
-- `[window].hide_on_focus_loss` (default `true`) gates only the _auto_-hide. When
-  off, the window leaves only via **—**, `Esc`, `Quit`, or the tray toggle.
+- `[window].hide_on_focus_loss` (default `false`) is opt-in and gates only the
+  _auto_-hide; it's fiddly around transient focus changes so it's off by default
+  now that **—**, `Esc`, and the tray click are all solid manual hides. When off
+  (the default), the window leaves only via those, `Quit`, or the tray toggle.
 - Reopening the tray lands on a clean screen: `App::sync_shown_screen` calls
   `ConfigApp::reset()` / `HomeApp::on_reopen()` on every visible-state change.
   The one exception: `HomeApp::on_reopen()` **keeps** an unfinished `MapPrompt`
