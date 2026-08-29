@@ -1,4 +1,4 @@
-//! `data.sqlite` — the operational state the daemon owns.
+//! `data.sqlite` - the operational state the daemon owns.
 //!
 //! Companion to [`crate::config`]: `config.toml` holds hand-editable preferences,
 //! this holds the bookkeeping the sync engine writes constantly and the user
@@ -15,7 +15,7 @@
 //! - a launch-time cache of each console's `validSaveSizes`.
 //!
 //! Call sites go through [`Store::get`] / [`Store::write`] and the typed methods
-//! on [`Store`] — never raw SQL — mirroring the `Config::get` / `Config::update`
+//! on [`Store`] - never raw SQL - mirroring the `Config::get` / `Config::update`
 //! shape. A single writer sits behind a `Mutex`; `write` runs the whole closure
 //! as one transaction.
 
@@ -35,7 +35,7 @@ static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
 const DB_FILE: &str = "data.sqlite";
 
 /// Ordered schema migrations. Applying entry `i` moves `PRAGMA user_version`
-/// from `i` to `i + 1`. **Append only** — never edit an entry that has shipped.
+/// from `i` to `i + 1`. **Append only** - never edit an entry that has shipped.
 const MIGRATIONS: &[&str] = &[
     // v0 -> v1: initial schema.
     "
@@ -123,6 +123,8 @@ pub struct QueuedUpload {
     pub attempts: u32,
     pub last_error: Option<String>,
     pub queued_at: String,
+    /// `YYYY-MM-DD HH:MM:SS` UTC of the last retry, or `None` if never tried.
+    pub last_attempt_at: Option<String>,
 }
 
 const INSTANCE_COLS: &str = "game_instance_id, save_path, console_slug, paused, \
@@ -165,7 +167,7 @@ impl Store {
     }
 
     /// Read from the store. The closure gets `&Store` and calls its typed
-    /// accessors. Don't nest another `get` / `write` inside — the lock is not
+    /// accessors. Don't nest another `get` / `write` inside - the lock is not
     /// reentrant.
     pub fn get<T>(f: impl FnOnce(&Store) -> rusqlite::Result<T>) -> anyhow::Result<T> {
         let guard = Self::slot().lock().unwrap_or_else(|e| e.into_inner());
@@ -173,7 +175,7 @@ impl Store {
     }
 
     /// Write to the store as a single transaction: every statement the closure
-    /// runs commits together, or — if it returns `Err` — rolls back together.
+    /// runs commits together, or - if it returns `Err` - rolls back together.
     /// Don't nest another `get` / `write` inside.
     pub fn write<T>(f: impl FnOnce(&Store) -> rusqlite::Result<T>) -> anyhow::Result<T> {
         let guard = Self::slot().lock().unwrap_or_else(|e| e.into_inner());
@@ -196,9 +198,9 @@ impl Store {
         match Self::open_at(&Self::path()) {
             Ok(store) => store,
             Err(e) => {
-                eprintln!("store: {e:#}");
+                tracing::warn!("store open failed: {e:#}");
                 Self::recover().unwrap_or_else(|e| {
-                    eprintln!("store: recovery failed, using an in-memory database: {e:#}");
+                    tracing::error!("store recovery failed, using in-memory db: {e:#}");
                     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
                     Store { conn: prepare(conn).expect("prepare in-memory sqlite") }
                 })
@@ -221,7 +223,7 @@ impl Store {
     fn recover() -> anyhow::Result<Store> {
         let path = Self::path();
         let backup = back_up(&path)?;
-        eprintln!("store: {} was unusable; moved to {}", path.display(), backup.display());
+        tracing::warn!("store file unusable, moved to {}", backup.display());
         Self::open_at(&path)
     }
 
@@ -360,7 +362,7 @@ impl Store {
     /// Pending uploads, oldest first.
     pub fn queued_uploads(&self) -> rusqlite::Result<Vec<QueuedUpload>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, game_instance_id, content_hash, bytes, size_bytes, attempts, last_error, queued_at
+            "SELECT id, game_instance_id, content_hash, bytes, size_bytes, attempts, last_error, queued_at, last_attempt_at
              FROM upload_queue ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -373,6 +375,7 @@ impl Store {
                 attempts: row.get::<_, i64>(5)? as u32,
                 last_error: row.get(6)?,
                 queued_at: row.get(7)?,
+                last_attempt_at: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -381,6 +384,13 @@ impl Store {
     /// Drop a queue row after its upload succeeds.
     pub fn dequeue_upload(&self, row_id: i64) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM upload_queue WHERE id = ?1", params![row_id])?;
+        Ok(())
+    }
+
+    /// Drop any queued uploads for `id` whose bytes are no longer current (the
+    /// file on disk moved on). Called when a newer version is uploaded or queued.
+    pub fn clear_stale_uploads(&self, id: &str, keep_hash: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM upload_queue WHERE game_instance_id = ?1 AND content_hash <> ?2", params![id, keep_hash])?;
         Ok(())
     }
 
@@ -416,7 +426,7 @@ impl Store {
 
     /// The cached accepted sizes for a console, if we've cached it.
     ///
-    /// Stored as JSON so the shape can grow — the backend may move from a plain
+    /// Stored as JSON so the shape can grow - the backend may move from a plain
     /// list to size ranges (see design.md); today it decodes as a list.
     pub fn console_sizes(&self, slug: &str) -> rusqlite::Result<Option<Vec<u64>>> {
         let json: Option<String> = self.conn.query_row("SELECT valid_save_sizes FROM console_save_sizes WHERE console_slug = ?1", params![slug], |r| r.get(0)).optional()?;
@@ -436,8 +446,8 @@ fn prepare(conn: Connection) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-/// Run any migrations the database hasn't seen yet. Each is applied — schema
-/// change plus the `user_version` bump — inside one transaction, so a crash
+/// Run any migrations the database hasn't seen yet. Each is applied - schema
+/// change plus the `user_version` bump - inside one transaction, so a crash
 /// mid-migration leaves the database at the previous version, not half-way.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let mut version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
@@ -611,6 +621,23 @@ mod tests {
         assert_eq!(row.bytes, b"b");
         assert_eq!(row.attempts, 0, "re-queue clears the attempt count");
         assert!(row.last_error.is_none());
+        assert!(row.last_attempt_at.is_none());
+    }
+
+    #[test]
+    fn clear_stale_uploads_keeps_only_the_current_hash() {
+        let store = mem();
+        store.bind_instance("i", Path::new("/p"), None).unwrap();
+        store.bind_instance("j", Path::new("/q"), None).unwrap();
+        store.enqueue_upload("i", "old1", b"a").unwrap();
+        store.enqueue_upload("i", "old2", b"b").unwrap();
+        store.enqueue_upload("i", "keep", b"c").unwrap();
+        store.enqueue_upload("j", "other", b"d").unwrap();
+
+        store.clear_stale_uploads("i", "keep").unwrap();
+
+        let hashes: Vec<_> = store.queued_uploads().unwrap().into_iter().map(|q| (q.game_instance_id, q.content_hash)).collect();
+        assert_eq!(hashes, [("i".to_owned(), "keep".to_owned()), ("j".to_owned(), "other".to_owned())]);
     }
 
     #[test]

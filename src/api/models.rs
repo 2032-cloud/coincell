@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `GET /auth/device/config` — the Auth0 parameters a client needs, plus the
+/// `GET /auth/device/config`: the Auth0 parameters a client needs, plus the
 /// server's own origin. Fetchable with no credentials.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
@@ -19,15 +19,22 @@ pub struct DeviceConfig {
     pub api_base: String,
 }
 
-/// `GET /api/me` on `cr.` — only what a device session actually has.
+/// `GET /api/me`: only the fields a device session uses. The payload carries
+/// more (Auth0 profile, session id, the account's `preferred_region` which the
+/// server already applies to game names) and its exact shape varies by domain,
+/// so everything here is lenient: a missing field must never fail the parse,
+/// since that's also the "session is valid" probe.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Me {
+    /// Ignored today; kept lenient so validation never hinges on it.
+    #[serde(default)]
     pub sub: String,
     /// `None` = follow system; `Some(true/false)` = light/dark.
+    #[serde(default)]
     pub theme: Option<bool>,
 }
 
-/// `GET /api/branding` — the service's presentation layer (name, palette,
+/// `GET /api/branding`: the service's presentation layer (name, palette,
 /// typography) so a client's chrome can follow the backend instead of
 /// hard-coding it. Public, no session required. Born snake_case, so unlike the
 /// rest of `models` it needs no `#[serde(alias)]`. A copy is baked into the
@@ -61,7 +68,7 @@ pub struct BrandIdentity {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BrandColors {
-    /// `"dark"` or `"light"` — the scheme to fall back to when nothing else (an
+    /// `"dark"` or `"light"`: the scheme to fall back to when nothing else (an
     /// explicit preference, the OS, the account) has decided.
     pub default_scheme: String,
     pub light: BrandPalette,
@@ -85,7 +92,7 @@ pub struct BrandPalette {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BrandTypography {
-    /// A CSS font stack. Advisory only — the app ships its own bundled font and
+    /// A CSS font stack. Advisory only: the app ships its own bundled font and
     /// can't resolve system families by name.
     pub font_family: String,
     /// A downloadable web font, if the service wants clients to match exactly.
@@ -113,7 +120,7 @@ pub struct BrandUsage {
 }
 
 /// A UTC timestamp in the server's `YYYY-MM-DD HH:MM:SS` format. Fixed-width and
-/// zero-padded, so byte order is chronological order — which is exactly what the
+/// zero-padded, so byte order is chronological order: which is exactly what the
 /// `?since=` cursor needs.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -151,6 +158,9 @@ pub struct Console {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Game {
     pub slug: String,
+    /// The display name, already resolved server-side for the account's
+    /// `preferred_region`. The response also carries per-region `titles` and a
+    /// `native_region`, but the client doesn't need them: `name` is authoritative.
     pub name: String,
     pub description: String,
     #[serde(alias = "iconUrl")]
@@ -185,7 +195,7 @@ pub struct GameInstance {
     #[serde(alias = "unstarredCount")]
     pub unstarred_count: u32,
     pub highlights: Vec<Highlight>,
-    /// The newest save's metadata — same shape as a `saves` row — so reacting to
+    /// The newest save's metadata: same shape as a `saves` row: so reacting to
     /// a change here needs no follow-up request.
     #[serde(alias = "latestSave")]
     pub latest_save: Option<SaveMeta>,
@@ -285,4 +295,36 @@ pub(crate) struct Upload {
 #[derive(Deserialize)]
 pub(crate) struct Session {
     pub session_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn me_is_lenient() {
+        // the live cr. /api/me shape (server resolves game names, client just
+        // reads `theme`)
+        let me: Me = serde_json::from_str(r#"{"sub":"auth0|x","theme":null,"preferred_region":"USA"}"#).unwrap();
+        assert!(me.theme.is_none());
+
+        // missing fields default, parse still succeeds (it's also the session probe)
+        let me: Me = serde_json::from_str("{}").unwrap();
+        assert_eq!(me.sub, "");
+
+        // a different domain's shape (nested `user`, extra keys) still parses
+        let me: Me = serde_json::from_str(r#"{"user":{"sub":"x"},"theme":true,"iss":"..."}"#).unwrap();
+        assert_eq!(me.theme, Some(true));
+    }
+
+    #[test]
+    fn game_decodes_ignoring_the_server_side_name_resolution_fields() {
+        // the response still carries `titles` / `native_region`; the client drops them
+        let g: Game = serde_json::from_str(
+            r#"{"slug":"mother-3","name":"Mother 3","description":"","titles":[{"name":"MOTHER3","region":"JPN","language":"ja"}],"native_region":"JPN","icon_url":"i","box_art_url":"b"}"#,
+        )
+        .unwrap();
+        assert_eq!(g.name, "Mother 3");
+        assert_eq!(g.box_art_url, "b");
+    }
 }

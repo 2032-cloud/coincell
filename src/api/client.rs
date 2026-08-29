@@ -49,7 +49,7 @@ impl Client {
         read_json(self.get("/api/me").send()?)
     }
 
-    /// `POST /auth/device/logout` — revokes exactly this session.
+    /// `POST /auth/device/logout`: revokes exactly this session.
     pub fn logout(&self) -> Result<()> {
         expect_no_content(self.post("/auth/device/logout").send()?)
     }
@@ -78,7 +78,7 @@ impl Client {
         Ok(read_json::<GameInstances>(self.get(&path).send()?)?.game_instances)
     }
 
-    /// `POST /api/game-instances` — returns the new instance id.
+    /// `POST /api/game-instances`: returns the new instance id.
     pub fn create_game_instance(&self, new: &NewGameInstance) -> Result<String> {
         Ok(read_json::<IdOnly>(self.post("/api/game-instances").json(new).send()?)?.id)
     }
@@ -97,7 +97,7 @@ impl Client {
         Ok(UploadOutcome { id: up.id, duplicate: up.duplicate })
     }
 
-    /// `GET /api/game-instances/:id/saves/:saveId` — the raw save bytes.
+    /// `GET /api/game-instances/:id/saves/:saveId`: the raw save bytes.
     pub fn download_save(&self, instance_id: &str, save_id: &str) -> Result<Vec<u8>> {
         let resp = self.get(&format!("/api/game-instances/{instance_id}/saves/{save_id}")).send()?;
         let status = resp.status();
@@ -125,7 +125,7 @@ impl Client {
     }
 }
 
-/// `GET /auth/device/config` — no session required, so it's a free function, not
+/// `GET /auth/device/config`: no session required, so it's a free function, not
 /// a [`Client`] method (you need its result before you can build a `Client`).
 pub fn fetch_device_config(api_base: &str) -> Result<DeviceConfig> {
     let http = reqwest::blocking::Client::new();
@@ -133,7 +133,7 @@ pub fn fetch_device_config(api_base: &str) -> Result<DeviceConfig> {
     read_json(http.get(url).send()?)
 }
 
-/// `GET /api/branding` — public, no session. Also a free function: the app wants
+/// `GET /api/branding`: public, no session. Also a free function: the app wants
 /// it before (or without) a `Client`, e.g. to theme the sign-in screen. Callers
 /// fall back to the baked copy on any error.
 pub fn fetch_branding(api_base: &str) -> Result<Branding> {

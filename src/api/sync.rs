@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, Sender, TryIter};
 use std::time::{Duration, Instant};
 
 use crate::api::events::{EventStream, StreamEvent};
-use crate::api::{Client, GameInstance, SaveMeta};
+use crate::api::{Client, Error, GameInstance, SaveMeta};
 
 pub enum SyncEvent {
     /// The realtime stream connected (fired on first connect and each reconnect).
@@ -25,8 +25,18 @@ pub enum SyncEvent {
     Synced { instances: Vec<GameInstance> },
     /// The server has this save for `instance_id` and the consumer may not.
     Changed { instance_id: String, latest: SaveMeta },
-    /// A poll or fetch failed. Not fatal — the stream keeps running.
+    /// A poll or fetch failed. Not fatal: the stream keeps running.
     Error { message: String },
+    /// A poll or fetch got `401`/`403`: the session is dead. The consumer
+    /// should log out, which drops this `SyncStream` and stops the retries.
+    Unauthorized,
+}
+
+/// Forward a client error as the right `SyncEvent`: `Unauthorized` is its own
+/// variant so the consumer doesn't have to string-match a dead session.
+fn send_err(tx: &Sender<SyncEvent>, e: Error, wake: &impl Fn()) {
+    let _ = tx.send(if e.is_unauthorized() { SyncEvent::Unauthorized } else { SyncEvent::Error { message: e.to_string() } });
+    wake();
 }
 
 pub struct SyncStream {
@@ -85,10 +95,7 @@ fn run(client: Client, since: Option<String>, fallback: Option<Duration>, tx: Se
             let _ = tx.send(SyncEvent::Synced { instances });
             wake();
         }
-        Err(e) => {
-            let _ = tx.send(SyncEvent::Error { message: e.to_string() });
-            wake();
-        }
+        Err(e) => send_err(&tx, e, &wake),
     }
 
     while !stop.load(Ordering::Relaxed) {
@@ -155,8 +162,7 @@ fn poll_and_emit(client: &Client, cursor: &mut Option<String>, tx: &Sender<SyncE
             ids
         }
         Err(e) => {
-            let _ = tx.send(SyncEvent::Error { message: e.to_string() });
-            wake();
+            send_err(tx, e, wake);
             Vec::new()
         }
     }
@@ -175,10 +181,7 @@ fn backfill_one(client: &Client, instance_id: &str, emitted: &[String], tx: &Sen
             wake();
         }
         Ok(_) => {}
-        Err(e) => {
-            let _ = tx.send(SyncEvent::Error { message: e.to_string() });
-            wake();
-        }
+        Err(e) => send_err(tx, e, wake),
     }
 }
 

@@ -12,7 +12,7 @@ pub enum Error {
     #[error("server returned {status}: {body}")]
     Status { status: u16, body: String },
 
-    /// `401`/`403` from any endpoint — the session id is invalid, expired, or
+    /// `401`/`403` from any endpoint: the session id is invalid, expired, or
     /// revoked. Callers should drop the stored session and re-authenticate.
     #[error("the session is invalid, expired, or revoked")]
     Unauthorized,
@@ -35,7 +35,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// `true` for [`Error::Unauthorized`] — the one error the UI reacts to by
+    /// `true` for [`Error::Unauthorized`]: the one error the UI reacts to by
     /// logging out.
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Error::Unauthorized)

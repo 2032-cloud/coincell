@@ -1,8 +1,8 @@
 //! The full `cr.2032.cloud` device API, plus the stateful pieces built on top of
 //! it (the realtime event stream and the sync orchestrator).
 //!
-//! This module deliberately depends on nothing from the rest of the crate — no
-//! `config`, no `constants`, no `egui` — so it can be lifted into its own crate
+//! This module deliberately depends on nothing from the rest of the crate, no
+//! `config`, no `constants`, no `egui`, so it can be lifted into its own crate
 //! later. Everything it needs (the API base URL, a session id, a client name, a
 //! repaint/wake callback) is passed in.
 

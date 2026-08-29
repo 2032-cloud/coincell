@@ -24,7 +24,7 @@ lazy_static! {
     pub static ref CONFIG_DIR: &'static Path = PROJECT_DIRS.config_dir();
     pub static ref DATA_DIR: &'static Path = PROJECT_DIRS.data_dir();
 
-    // IDENTITY — resolved once at startup. Empty string means "couldn't tell".
+    // IDENTITY: resolved once at startup. Empty string means "couldn't tell".
     pub static ref USERNAME: String = whoami::username().unwrap_or_default();
     pub static ref DEVICE_NAME: String = whoami::devicename().unwrap_or_default();
     pub static ref PLATFORM: String = whoami::platform().to_string();

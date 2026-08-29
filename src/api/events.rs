@@ -1,8 +1,8 @@
 //! Realtime notifications from `GET /api/events` (a WebSocket).
 //!
 //! The server sends `{"type":"save","instanceId":"…"}` whenever another device
-//! uploads a genuinely new save. It's a pure relay with no backfill — a missed
-//! message is caught by the next `?since=` poll — so this type only surfaces
+//! uploads a genuinely new save. It's a pure relay with no backfill, a missed
+//! message is caught by the next `?since=` poll, so this type only surfaces
 //! "instance X changed", never the save itself. Reconnects on its own with
 //! backoff.
 

@@ -185,7 +185,7 @@ pub fn revoke_in_background(client: Client) {
         .name("api-logout".into())
         .spawn(move || {
             if let Err(err) = client.logout() {
-                eprintln!("logout: {err}");
+                tracing::warn!("logout request failed: {err}");
             }
         })
         .ok();

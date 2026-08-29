@@ -1,12 +1,10 @@
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::api::Branding;
-use crate::app::icons;
+use crate::app::{icons, open_path};
 use crate::config::{Config, ConflictPolicy, LogLevel, PollInterval, Theme, UpdateAction, UpdateChannel, UploadTrigger};
 use crate::theme::homepage_path;
 
@@ -14,6 +12,8 @@ use crate::theme::homepage_path;
 pub enum ConfigOutcome {
     /// Nothing to do; stay in the config window.
     Stay,
+    /// "Sync now" pressed, poke the sync engine.
+    SyncNow,
     /// User confirmed logout: revoke + clear the session, return to sign-in.
     LogOut,
     /// User confirmed quit: shut the daemon down entirely.
@@ -136,7 +136,11 @@ impl ConfigApp {
                 ui.add_space(4.0);
                 match self.section {
                     Section::Account => self.account(ui, branding),
-                    Section::Sync => self.sync(ui),
+                    Section::Sync => {
+                        if self.sync(ui) {
+                            outcome = ConfigOutcome::SyncNow;
+                        }
+                    }
                     Section::Startup => self.startup(ui),
                     Section::Notifications => self.notifications(ui),
                     Section::Appearance => self.appearance(ui),
@@ -205,7 +209,8 @@ impl ConfigApp {
         }
     }
 
-    fn sync(&mut self, ui: &mut egui::Ui) {
+    /// Returns `true` if "Sync now" was pressed this frame.
+    fn sync(&mut self, ui: &mut egui::Ui) -> bool {
         let mut s = Config::get(|c| c.sync.clone());
         let mut changed = false;
 
@@ -231,9 +236,15 @@ impl ConfigApp {
         });
 
         if changed {
-            let r = Config::update(|c| c.sync = s);
+            let r = Config::update(|c| c.sync = s.clone());
             self.note_save(r);
         }
+
+        ui.add_space(10.0);
+        let sync_now = ui.add_enabled(s.enabled, egui::Button::new("Sync now")).on_hover_text("Check the server for changes right now").clicked();
+        ui.add_space(4.0);
+        ui.small("The engine also runs on the realtime stream and the poll interval above. Upload direction and per-game controls arrive with the Home window.");
+        sync_now
     }
 
     fn startup(&mut self, ui: &mut egui::Ui) {
@@ -246,7 +257,7 @@ impl ConfigApp {
             self.note_save(r);
         }
         ui.add_space(6.0);
-        ui.small("OS auto-start registration isn't wired up yet — this records the preference only.");
+        ui.small("OS auto-start registration isn't wired up yet, this records the preference only.");
     }
 
     fn notifications(&mut self, ui: &mut egui::Ui) {
@@ -328,6 +339,7 @@ impl ConfigApp {
                 self.note_save(r);
             }
         });
+        ui.small("Applies on restart.");
 
         ui.add_space(8.0);
 
@@ -338,7 +350,9 @@ impl ConfigApp {
             self.note_save(r);
         }
         if current.is_none() {
-            ui.small("Not answered yet — you'll be asked once after signing in.");
+            ui.small("Not answered yet, you'll be asked once after signing in.");
+        } else {
+            ui.small("Applies on restart.");
         }
 
         ui.add_space(8.0);
@@ -367,6 +381,9 @@ impl ConfigApp {
             }
             if ui.button("Open data folder").clicked() {
                 open_path(*crate::constants::DATA_DIR);
+            }
+            if ui.button("Open logs folder").clicked() {
+                open_path(&crate::logging::log_dir());
             }
             if ui.button("Copy diagnostics").clicked() {
                 ui.copy_text(diagnostics());
@@ -437,26 +454,16 @@ fn confirm(ui: &mut egui::Ui, prompt: &str, affirm: &str) -> Option<bool> {
     result
 }
 
-fn open_path(path: &Path) {
-    let spawned = if cfg!(target_os = "windows") {
-        Command::new("explorer").arg(path).spawn()
-    } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(path).spawn()
-    } else {
-        Command::new("xdg-open").arg(path).spawn()
-    };
-    let _ = spawned;
-}
-
 fn diagnostics() -> String {
-    let signed_in = Config::get(|c| c.session_id().is_some());
+    let (signed_in, level) = Config::get(|c| (c.session_id().is_some(), c.advanced.log_level));
     format!(
-        "CoinCell {ver}\nOS: {os} {arch}\nConfig: {cfg}\nData: {data}\nSigned in: {signed_in}",
+        "CoinCell {ver}\nOS: {os} {arch}\nConfig: {cfg}\nData: {data}\nLogs: {logs}\nLog level: {level:?}\nSigned in: {signed_in}",
         ver = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         cfg = crate::constants::CONFIG_DIR.display(),
         data = crate::constants::DATA_DIR.display(),
+        logs = crate::logging::log_dir().display(),
     )
 }
 

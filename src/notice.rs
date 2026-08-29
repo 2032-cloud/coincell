@@ -1,0 +1,213 @@
+//! The user-facing notification queue.
+//!
+//! Anything in the app can `notice::post(Notice::..)` from any thread. `App`
+//! calls [`pump`] once a frame to drain the queue to a [`Sink`]. `post` gates on
+//! the `[notifications]` config (master switch plus one flag per kind) and
+//! collapses repeats: the same notice inside [`DEDUP_WINDOW`] is dropped, so a
+//! burst of pulls or a flapping conflict is one line, not ten.
+//!
+//! The delivery backend is deliberately unfinished. The only [`Sink`] wired
+//! today is [`LogSink`], a `tracing` line. A real OS toast sink (notify-rust, or
+//! a hand rolled per platform one, undecided) slots in through [`set_sink`] in
+//! `main` with no change to any call site.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::config::{Config, Notifications};
+
+/// Repeats of the same notice inside this window are dropped.
+const DEDUP_WINDOW: Duration = Duration::from_secs(10);
+
+/// One user-facing event. One variant per `[notifications]` toggle; the payload
+/// is whatever the text needs (game names are resolved before posting, never
+/// raw ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// A newer save was pulled from the server and written to disk.
+    Pulled { game: String },
+    /// A save diverged on both sides; the user has to pick.
+    Conflict { game: String },
+    /// A non fatal sync error worth surfacing. Not posted yet: see the
+    /// `TODO(notice)` in `App::drain_sync`.
+    #[allow(dead_code)]
+    Error { detail: String },
+    /// The session died mid sync and the app signed out.
+    SessionExpired,
+}
+
+impl Notice {
+    /// Fixed heading for the notice.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Notice::Pulled { .. } => "Save updated",
+            Notice::Conflict { .. } => "Sync conflict",
+            Notice::Error { .. } => "Sync problem",
+            Notice::SessionExpired => "Signed out",
+        }
+    }
+
+    /// Body line.
+    pub fn body(&self) -> String {
+        match self {
+            Notice::Pulled { game } => format!("{game} picked up a newer save from another device."),
+            Notice::Conflict { game } => format!("{game} changed here and on another device. Open coincell to choose which to keep."),
+            Notice::Error { detail } => detail.clone(),
+            Notice::SessionExpired => "Your session expired. Sign in again to keep syncing.".to_owned(),
+        }
+    }
+
+    /// Key for the dedup window: same key inside [`DEDUP_WINDOW`] is one notice.
+    fn dedup_key(&self) -> String {
+        match self {
+            Notice::Pulled { game } => format!("pull:{game}"),
+            Notice::Conflict { game } => format!("conflict:{game}"),
+            Notice::Error { detail } => format!("error:{detail}"),
+            Notice::SessionExpired => "session-expired".to_owned(),
+        }
+    }
+
+    /// `[notifications]` gate: master switch and the matching per kind flag.
+    fn allowed_by(&self, n: &Notifications) -> bool {
+        n.enabled
+            && match self {
+                Notice::Pulled { .. } => n.on_pull,
+                Notice::Conflict { .. } => n.on_conflict,
+                Notice::Error { .. } => n.on_error,
+                Notice::SessionExpired => n.on_session_expired,
+            }
+    }
+}
+
+/// Where accepted notices go. Implementations must not block (spawn a thread if
+/// the platform call is slow); [`pump`] calls this on the UI thread.
+pub trait Sink: Send + Sync {
+    fn deliver(&self, notice: &Notice);
+}
+
+/// The default sink until an OS backend is chosen: a log line.
+struct LogSink;
+
+impl Sink for LogSink {
+    fn deliver(&self, notice: &Notice) {
+        tracing::info!("notify: {} | {}", notice.title(), notice.body());
+    }
+}
+
+static LOG_SINK: LogSink = LogSink;
+static SINK: OnceLock<Box<dyn Sink>> = OnceLock::new();
+static QUEUE: OnceLock<Mutex<Queue>> = OnceLock::new();
+
+#[derive(Default)]
+struct Queue {
+    pending: Vec<Notice>,
+    /// dedup key -> when it was last accepted.
+    recent: HashMap<String, Instant>,
+}
+
+impl Queue {
+    /// Apply the config gate and the dedup window; on success push to `pending`.
+    /// Split out from [`post`] so the policy is testable without global state.
+    fn admit(&mut self, notice: Notice, now: Instant, cfg: &Notifications) -> bool {
+        if !notice.allowed_by(cfg) {
+            return false;
+        }
+        let key = notice.dedup_key();
+        if let Some(&last) = self.recent.get(&key)
+            && now.duration_since(last) < DEDUP_WINDOW
+        {
+            return false;
+        }
+        self.recent.insert(key, now);
+        self.recent.retain(|_, t| now.duration_since(*t) < DEDUP_WINDOW);
+        self.pending.push(notice);
+        true
+    }
+}
+
+fn queue() -> &'static Mutex<Queue> {
+    QUEUE.get_or_init(|| Mutex::new(Queue::default()))
+}
+
+fn sink() -> &'static dyn Sink {
+    match SINK.get() {
+        Some(s) => s.as_ref(),
+        None => &LOG_SINK,
+    }
+}
+
+/// Install the real delivery backend. Call once, from `main`, before the UI
+/// starts. A second call is ignored with a warning.
+#[allow(dead_code)] // wired from `main` once an OS toast backend is picked
+pub fn set_sink(backend: Box<dyn Sink>) {
+    if SINK.set(backend).is_err() {
+        tracing::warn!("notice sink already set");
+    }
+}
+
+/// Queue a notice. Cheap and thread safe: gates on `[notifications]`, dedupes,
+/// and returns. Delivery happens in [`pump`].
+pub fn post(notice: Notice) {
+    let cfg = Config::get(|c| c.notifications.clone());
+    let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+    q.admit(notice, Instant::now(), &cfg);
+}
+
+/// Deliver everything queued since the last call. `App::logic` runs this once a
+/// frame.
+pub fn pump() {
+    let due = {
+        let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+        if q.pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut q.pending)
+    };
+    let sink = sink();
+    for notice in &due {
+        sink.deliver(notice);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_on(enabled: bool) -> Notifications {
+        Notifications { enabled, on_pull: true, on_conflict: true, on_error: true, on_session_expired: true }
+    }
+
+    #[test]
+    fn master_switch_gates_every_kind() {
+        let mut q = Queue::default();
+        assert!(!q.admit(Notice::SessionExpired, Instant::now(), &all_on(false)));
+        assert!(q.pending.is_empty());
+    }
+
+    #[test]
+    fn per_kind_flag_is_respected() {
+        let mut q = Queue::default();
+        let mut cfg = all_on(true);
+        cfg.on_conflict = false;
+        let now = Instant::now();
+        assert!(!q.admit(Notice::Conflict { game: "Mother 3".into() }, now, &cfg));
+        assert!(q.admit(Notice::Pulled { game: "Mother 3".into() }, now, &cfg));
+        assert_eq!(q.pending.len(), 1);
+    }
+
+    #[test]
+    fn identical_notice_is_deduped_inside_the_window() {
+        let mut q = Queue::default();
+        let cfg = all_on(true);
+        let t0 = Instant::now();
+        assert!(q.admit(Notice::Conflict { game: "Mother 3".into() }, t0, &cfg));
+        // same game, still inside the window: dropped
+        assert!(!q.admit(Notice::Conflict { game: "Mother 3".into() }, t0 + Duration::from_secs(3), &cfg));
+        // a different game is its own line
+        assert!(q.admit(Notice::Conflict { game: "Zelda".into() }, t0 + Duration::from_secs(3), &cfg));
+        // past the window it can repeat
+        assert!(q.admit(Notice::Conflict { game: "Mother 3".into() }, t0 + DEDUP_WINDOW + Duration::from_secs(1), &cfg));
+        assert_eq!(q.pending.len(), 3);
+    }
+}

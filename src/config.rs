@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for PollInterval {
     }
 }
 
-/// A required, explicit interval (no auto/off) — e.g. the update-check cadence.
+/// A required, explicit interval (no auto/off) e.g. the update-check cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval(pub Duration);
 
@@ -353,10 +353,11 @@ impl Config {
     }
 
     fn load() -> Config {
+        // Bootstrap: this runs before `logging::init`, so it prints directly.
         let config = match Self::try_load() {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("config: falling back to defaults: {e:#}");
+                eprintln!("config: load failed, using defaults ({e:#})");
                 Config::default()
             }
         };
@@ -377,7 +378,7 @@ impl Config {
             Ok(cfg) => Ok(cfg),
             Err(e) => {
                 let backup = back_up(&path)?;
-                eprintln!("config: {} was invalid ({e}); backed up to {}", path.display(), backup.display());
+                eprintln!("config: invalid ({e}), backed up to {}", backup.display());
                 let cfg = Config::default();
                 cfg.save()?;
                 Ok(cfg)

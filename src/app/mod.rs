@@ -1,19 +1,23 @@
 mod config;
+mod fonts;
 mod home;
 mod icons;
+mod mapping;
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use eframe::egui;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
-use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, SessionCheck, SessionStatus, SyncEvent, SyncStream};
+use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, GameInstance, SessionCheck, SessionStatus};
 use crate::app::config::{ConfigApp, ConfigOutcome};
-use crate::app::home::HomeApp;
-use crate::config::{Config, PollInterval};
+use crate::app::home::{HomeApp, HomeOutcome, HomeView};
+use crate::config::Config;
 use crate::constants::CLIENT_NAME;
+use crate::notice::{self, Notice};
+use crate::sync::{EngineEvent, SyncEngine};
 use crate::theme::{self, Scheme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +61,14 @@ enum LoginIntent {
     ReopenBrowser,
 }
 
+/// A native file picker (`rfd`) running on its own thread. While one is live the
+/// window won't auto-hide; the chosen path is handed back to `HomeApp` when it
+/// lands.
+struct PendingPick {
+    instance_id: String,
+    rx: Receiver<Option<std::path::PathBuf>>,
+}
+
 pub struct App {
     state: WindowState,
     prev_state: WindowState,
@@ -77,15 +89,32 @@ pub struct App {
     account_theme: Option<Option<bool>>,
     /// Last scheme handed to [`theme::apply`], so we only re-apply on a change.
     applied_scheme: Option<Scheme>,
-    /// Live while a session is Ready. Dropping it stops the stream + poller.
-    sync: Option<SyncStream>,
+    /// Live while a session is Ready. Dropping it stops the stream + poller and
+    /// the engine worker.
+    sync: Option<SyncEngine>,
+    /// Every game instance on the account, from the engine's hydrate, what Home
+    /// renders. `false` until the first `Hydrated` lands.
+    catalog: Vec<GameInstance>,
+    catalog_ready: bool,
+    /// A save-file picker Home asked for, running off the UI thread. While set,
+    /// the window won't auto-hide.
+    pending_pick: Option<PendingPick>,
+    /// Last `Visible(_)` we told the OS window, so we only re-send on a change.
+    visible_cmd: Option<bool>,
+    /// Frames left where `reconcile_visibility` re-asserts unconditionally, to
+    /// out-last eframe's first-paint `set_visible(true)`.
+    visible_settling: u8,
     config_app: ConfigApp,
     home_app: HomeApp,
 }
 
 impl App {
-    pub fn new(ctx: egui::Context, wake_rx: Receiver<()>, device_config: DeviceConfig, branding: Branding) -> Self {
-        icons::install(&ctx);
+    pub fn new(ctx: egui::Context, wake_rx: Receiver<()>, device_config: DeviceConfig, branding: Branding, start_hidden: bool) -> Self {
+        fonts::install(&ctx);
+        egui_extras::install_image_loaders(&ctx);
+        // Persistent disk cache for remote art; must come after the line above so
+        // it's tried ahead of egui_extras' network loader.
+        crate::asset::install(&ctx);
 
         // Theme the first frame (the sign-in screen) before anything draws.
         let scheme = theme::resolve(Config::get(|c| c.appearance.theme), None, ctx.system_theme(), &branding);
@@ -95,9 +124,12 @@ impl App {
             Some(client) => AuthView::Validating { check: SessionCheck::start(client, waker(&ctx)) },
             None => AuthView::LoggedOut { error: None },
         };
+        // `[startup].start_hidden`: begin in the tray, no window. The tray toggle
+        // sends `Visible(true)` from here, so the two stay in step.
+        let state = if start_hidden { WindowState::Hidden } else { WindowState::ShowConfig };
         Self {
-            state: WindowState::ShowConfig,
-            prev_state: WindowState::ShowConfig,
+            state,
+            prev_state: state,
             focus_latch: true,
             quitting: false,
             ask_crash_reports: false,
@@ -108,6 +140,11 @@ impl App {
             account_theme: None,
             applied_scheme: Some(scheme),
             sync: None,
+            catalog: Vec::new(),
+            catalog_ready: false,
+            pending_pick: None,
+            visible_cmd: None,
+            visible_settling: 0,
             config_app: ConfigApp::new(),
             home_app: HomeApp::new(),
         }
@@ -123,36 +160,89 @@ impl App {
         }
     }
 
-    /// Start the realtime + polling sync stream, unless syncing is paused or one
-    /// is already running.
+    /// Start the sync engine (which owns the realtime + polling stream), unless
+    /// syncing is paused or one is already running.
     fn start_sync(&mut self, ctx: &egui::Context) {
         if self.sync.is_some() || !Config::get(|c| c.sync.enabled) {
             return;
         }
         let Some(client) = api_client() else { return };
-        let fallback = Config::get(|c| match c.sync.poll {
-            PollInterval::Auto => Some(Duration::from_secs(300)),
-            PollInterval::Off => None,
-            PollInterval::Every(d) => Some(d),
-        });
-        self.sync = Some(SyncStream::start(client, None, fallback, waker(ctx)));
+        self.sync = Some(SyncEngine::start(client, waker(ctx)));
     }
 
-    /// Drain whatever the sync stream has produced. For now this only logs — the
-    /// sync engine that consumes these events isn't built yet.
-    fn drain_sync(&mut self) {
-        let Some(sync) = &self.sync else { return };
-        for event in sync.events() {
+    /// Drain what the engine has surfaced. Download/write already happened on the
+    /// worker; this keeps the catalog current and reacts to session expiry.
+    fn drain_sync(&mut self, ctx: &egui::Context) {
+        let Some(engine) = &self.sync else { return };
+        let mut session_expired = false;
+        for event in engine.events() {
             match event {
-                SyncEvent::Connected => eprintln!("sync: stream connected"),
-                SyncEvent::Disconnected { reason } => eprintln!("sync: stream disconnected ({reason})"),
-                SyncEvent::Synced { instances } => eprintln!("sync: hydrated {} instance(s)", instances.len()),
-                SyncEvent::Changed { instance_id, latest } => {
-                    eprintln!("sync: {instance_id} has save {} ({} bytes, hash {})", latest.id, latest.size_bytes, latest.content_hash);
+                EngineEvent::Hydrated { instances } => {
+                    self.catalog = instances;
+                    self.catalog_ready = true;
                 }
-                SyncEvent::Error { message } => eprintln!("sync: {message}"),
+                EngineEvent::SaveAdvanced { instance_id, latest } => {
+                    if let Some(row) = self.catalog.iter_mut().find(|g| g.id == instance_id) {
+                        row.last_saved_at = Some(latest.uploaded_at.clone());
+                        row.latest_save = Some(latest);
+                    }
+                }
+                EngineEvent::Status(status) => tracing::debug!("stream {status:?}"),
+                EngineEvent::Pulled { instance_id } => {
+                    tracing::info!("pulled newer save for {instance_id}");
+                    notice::post(Notice::Pulled { game: self.game_label(&instance_id) });
+                }
+                EngineEvent::Pushed { instance_id } => tracing::info!("pushed save for {instance_id}"),
+                EngineEvent::PushPending { instance_id } => tracing::debug!("{instance_id}: local change waiting (manual upload)"),
+                EngineEvent::Conflict { instance_id } => {
+                    tracing::warn!("{instance_id}: conflict, resolve in Home");
+                    notice::post(Notice::Conflict { game: self.game_label(&instance_id) });
+                }
+                // TODO(notice): decide which sync errors are toast-worthy before wiring `Notice::Error` ([notifications].on_error already exists).
+                EngineEvent::Error(message) => tracing::warn!("sync: {message}"),
+                EngineEvent::SessionExpired => session_expired = true,
             }
         }
+        if session_expired {
+            self.handle_session_expired(ctx);
+        }
+    }
+
+    /// A human name for an instance id, for notice text; the id itself if the
+    /// catalog doesn't have it (e.g. it was deleted server side).
+    fn game_label(&self, instance_id: &str) -> String {
+        self.catalog.iter().find(|g| g.id == instance_id).map(|g| g.name.clone()).unwrap_or_else(|| instance_id.to_owned())
+    }
+
+    /// Spawn a native picker on its own thread (RFD inits COM per call, so any
+    /// thread is fine). The window stops auto-hiding until it resolves.
+    fn open_save_dialog(&mut self, ctx: &egui::Context, instance_id: String, title: String) {
+        if self.pending_pick.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("save-file-dialog".into())
+            .spawn(move || {
+                let _ = tx.send(mapping::pick_save_file(&title));
+                ctx.request_repaint();
+            })
+            .expect("spawn save-file-dialog thread");
+        self.pending_pick = Some(PendingPick { instance_id, rx });
+    }
+
+    /// Hand a finished pick back to Home (`None` means the user cancelled). The
+    /// focus latch is re-armed: the native dialog held focus, and the OS can be
+    /// a frame or two returning it, which would otherwise read as a focus-loss
+    /// auto-hide.
+    fn drain_pending_pick(&mut self) {
+        let Some(pending) = &self.pending_pick else { return };
+        let Ok(result) = pending.rx.try_recv() else { return };
+        let instance_id = pending.instance_id.clone();
+        self.pending_pick = None;
+        self.focus_latch = true;
+        self.home_app.deliver_save_pick(&instance_id, result);
     }
 
     /// Reset the sub-screen to its default whenever the visible window changes,
@@ -163,23 +253,46 @@ impl App {
         }
         match self.state {
             WindowState::ShowConfig => self.config_app.reset(),
-            WindowState::ShowHome => self.home_app.reset(),
+            WindowState::ShowHome => self.home_app.on_reopen(),
             WindowState::Hidden => {}
         }
         self.prev_state = self.state;
     }
 
-    fn begin_logout(&mut self, ctx: &egui::Context) {
-        if let Some(client) = api_client() {
-            api::revoke_in_background(client);
-        }
+    /// Tear down every trace of the current session and return to the sign-in
+    /// screen, showing `error` there if one is given.
+    fn clear_session_state(&mut self, error: Option<Arc<str>>) {
         let _ = Config::update(|c| c.clear_session());
         self.sync = None;
-        self.auth = AuthView::LoggedOut { error: None };
+        self.catalog = Vec::new();
+        self.catalog_ready = false;
+        self.pending_pick = None;
+        self.auth = AuthView::LoggedOut { error };
         self.focus_latch = true;
         self.ask_crash_reports = false;
         self.account_theme = None;
         self.config_app.reset();
+        self.home_app.reset();
+    }
+
+    /// User-initiated logout: also tell the server to revoke this session.
+    fn begin_logout(&mut self, ctx: &egui::Context) {
+        if let Some(client) = api_client() {
+            api::revoke_in_background(client);
+        }
+        self.clear_session_state(None);
+        ctx.request_repaint();
+    }
+
+    /// The engine hit a `401`/`403` mid-sync. The session is already dead, so no
+    /// revoke call, just drop back to sign-in with a note.
+    fn handle_session_expired(&mut self, ctx: &egui::Context) {
+        if matches!(self.auth, AuthView::LoggedOut { .. }) {
+            return; // already handled this round
+        }
+        tracing::warn!("session expired mid-sync, signing out");
+        self.clear_session_state(Some(Arc::from("Your session expired. Please sign in again.")));
+        notice::post(Notice::SessionExpired);
         ctx.request_repaint();
     }
 
@@ -211,15 +324,35 @@ impl App {
         }
     }
 
-    fn hide(&mut self) -> egui::ViewportCommand {
+    /// Set desired window state. The OS window is brought in line by
+    /// [`Self::reconcile_visibility`] on the next `logic()` tick, not here.
+    fn hide(&mut self) {
         self.state = WindowState::Hidden;
         self.focus_latch = false;
-        egui::ViewportCommand::Visible(false)
+    }
+
+    /// Command the OS window to match `state` (visible unless `Hidden`). eframe
+    /// force-shows the window once after the first paint (its anti-flash hack)
+    /// and `ViewportBuilder::with_visible` is ignored, so this is the only thing
+    /// that reliably keeps a `start_hidden` launch hidden. For the first few
+    /// frames it re-asserts unconditionally (and repaints) to out-last that
+    /// one-shot show; after that it only sends on a change.
+    fn reconcile_visibility(&mut self, ctx: &egui::Context) {
+        let want_visible = !self.state.hidden();
+        let settling = self.visible_settling < 3;
+        if settling {
+            self.visible_settling += 1;
+            ctx.request_repaint();
+        }
+        if settling || self.visible_cmd != Some(want_visible) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want_visible));
+            self.visible_cmd = Some(want_visible);
+        }
     }
 
     /// The shared title bar for every screen (Config, Home, sign-in): screen
     /// name on the left, a minimise-to-tray button on the right. Hidden while a
-    /// native dialog would be up is unnecessary — it's just chrome.
+    /// native dialog would be up is unnecessary, it's just chrome.
     fn header(&mut self, ui: &mut egui::Ui) {
         let title = if !matches!(self.auth, AuthView::Ready) {
             "CoinCell"
@@ -239,27 +372,25 @@ impl App {
             });
         });
         if minimise {
-            ui.send_viewport_cmd(self.hide());
+            self.hide();
         }
     }
 
-    fn show_home(&mut self) -> egui::ViewportCommand {
+    fn show_home(&mut self) {
         self.state = WindowState::ShowHome;
         self.focus_latch = true;
-        egui::ViewportCommand::Visible(true)
     }
 
-    fn show_config(&mut self) -> egui::ViewportCommand {
+    fn show_config(&mut self) {
         self.state = WindowState::ShowConfig;
         self.focus_latch = true;
-        egui::ViewportCommand::Visible(true)
     }
 
     fn pump_auth(&mut self, ctx: &egui::Context) {
         enum Next {
             Stay,
             Ready,
-            /// Session just saved after a device login — bounce through
+            /// Session just saved after a device login, bounce through
             /// validation once to confirm it and pick up the account theme.
             Revalidate,
             LoggedOut(Option<Arc<str>>),
@@ -297,7 +428,7 @@ impl App {
                 }
                 Some(SessionStatus::Invalid) => Next::LoggedOut(Some(Arc::from("Your session has expired. Please sign in again."))),
                 Some(SessionStatus::Unknown(msg)) => {
-                    eprintln!("auth: couldn't verify stored session, keeping it: {msg}");
+                    tracing::info!("couldn't verify stored session, keeping it: {msg}");
                     Next::Ready
                 }
                 None => Next::Stay,
@@ -412,7 +543,7 @@ impl eframe::App for App {
             match event {
                 TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Down, .. } => {
                     if self.state.hidden() {
-                        ctx.send_viewport_cmd(self.show_home());
+                        self.show_home();
                     } else {
                         if self.state.is_config() {
                             self.state = WindowState::ShowHome;
@@ -422,7 +553,7 @@ impl eframe::App for App {
                 }
                 TrayIconEvent::Click { button: MouseButton::Right, button_state: MouseButtonState::Down, .. } => {
                     if self.state.hidden() {
-                        ctx.send_viewport_cmd(self.show_config());
+                        self.show_config();
                     } else {
                         if self.state.is_home() {
                             self.state = WindowState::ShowConfig;
@@ -435,7 +566,7 @@ impl eframe::App for App {
         }
         while self.wake_rx.try_recv().is_ok() {
             if self.state.hidden() {
-                ctx.send_viewport_cmd(self.show_home());
+                self.show_home();
             } else {
                 if self.state.is_home() {
                     self.state = WindowState::ShowConfig;
@@ -445,8 +576,11 @@ impl eframe::App for App {
         }
 
         self.pump_auth(ctx);
-        self.drain_sync();
+        self.drain_sync(ctx);
+        notice::pump();
+        self.drain_pending_pick();
         self.sync_shown_screen();
+        self.reconcile_visibility(ctx);
 
         if self.state.is_config() {
             self.config_app.logic(ctx, frame);
@@ -457,11 +591,18 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.state.hidden() {
-            ui.request_repaint_after(Duration::from_millis(250));
+            // Paint a valid (blank, themed) frame so a window that's momentarily
+            // shown — e.g. during the first-frame settle — is never just black.
+            egui::CentralPanel::default().show(ui, |_| {});
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
             return;
         }
 
         let busy_auth = matches!(self.auth, AuthView::Connecting { .. } | AuthView::Validating { .. });
+        // Anything that hands focus to a native window we don't own: the device
+        // flow / session check, and the off-thread save-file picker. Losing focus
+        // to one of those must not minimise us.
+        let modal_active = busy_auth || self.pending_pick.is_some();
 
         let lost_focus = ui.input(|i| {
             if i.focused {
@@ -471,9 +612,9 @@ impl eframe::App for App {
                 !self.focus_latch
             }
         });
-        if lost_focus && !self.quitting && !self.ask_crash_reports && !busy_auth && Config::get(|c| c.window.hide_on_focus_loss) {
+        if lost_focus && !self.quitting && !self.ask_crash_reports && !modal_active && Config::get(|c| c.window.hide_on_focus_loss) {
             ui.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.send_viewport_cmd(self.hide());
+            self.hide();
         }
 
         // Shared title bar (carries the minimise button). Esc is handled at the
@@ -488,14 +629,48 @@ impl eframe::App for App {
             if self.state.is_config() {
                 match self.config_app.ui(ui, frame, &self.branding) {
                     ConfigOutcome::Stay => {}
+                    ConfigOutcome::SyncNow => {
+                        if let Some(engine) = &self.sync {
+                            engine.sync_now();
+                        }
+                    }
                     ConfigOutcome::LogOut => self.begin_logout(ui.ctx()),
                     ConfigOutcome::Quit => {
                         self.quitting = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
-            } else if self.state.is_home() {
-                self.home_app.ui(ui, frame, &self.branding);
+            } else if self.state.is_home()
+                && let Some(client) = api_client()
+            {
+                let home = HomeView { catalog: &self.catalog, ready: self.catalog_ready, api_base: &self.device_config.api_base, branding: &self.branding, client: &client };
+                match self.home_app.ui(ui, frame, home) {
+                    HomeOutcome::Stay => {}
+                    HomeOutcome::Refresh => {
+                        if let Some(engine) = &self.sync {
+                            engine.rehydrate();
+                        }
+                    }
+                    HomeOutcome::MappedInstance { instance_id } => {
+                        if let Some(engine) = &self.sync {
+                            engine.recheck(&instance_id);
+                            engine.rehydrate();
+                        }
+                    }
+                    HomeOutcome::RecheckInstance { instance_id } => {
+                        if let Some(engine) = &self.sync {
+                            engine.recheck(&instance_id);
+                        }
+                    }
+                    HomeOutcome::ResolveConflict { instance_id, keep_local } => {
+                        if let Some(engine) = &self.sync {
+                            engine.resolve_conflict(&instance_id, keep_local);
+                        }
+                    }
+                    HomeOutcome::OpenSaveDialog { instance_id, title } => {
+                        self.open_save_dialog(ui.ctx(), instance_id, title);
+                    }
+                }
             }
         } else {
             match self.login_screen(ui) {
@@ -513,12 +688,28 @@ impl eframe::App for App {
 
         // Esc minimises, but only if nothing this frame (an open combo, the
         // first-run modal, a text edit) already claimed the key.
-        if !busy_auth && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            ui.send_viewport_cmd(self.hide());
+        if !modal_active && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.hide();
         }
 
+        // A `hide()` above takes effect on the next `logic()` tick; nudge one.
+        if self.state.hidden() {
+            ui.ctx().request_repaint();
+        }
         ui.request_repaint_after(Duration::from_millis(100));
     }
+}
+
+/// Open a file or folder in the OS file manager.
+fn open_path(path: &std::path::Path) {
+    let cmd = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(cmd).arg(path).spawn();
 }
 
 /// A `Client` for the current session, or `None` when logged out.

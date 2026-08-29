@@ -8,7 +8,7 @@
 //! setting, and the OS.
 //!
 //! Typography from the payload is deliberately not applied: `font_source_url` is
-//! `None` (nothing to download) and egui can't resolve a CSS family by name — the
+//! `None` (nothing to download) and egui can't resolve a CSS family by name, the
 //! bundled font stands in. Wire it up here if the service starts serving a font.
 
 use eframe::egui::{self, Color32};
