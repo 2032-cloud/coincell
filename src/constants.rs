@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use lazy_static::lazy_static;
@@ -23,6 +23,10 @@ lazy_static! {
     pub static ref PROJECT_DIRS: ProjectDirs = directories::ProjectDirs::from("com", COMPANY_NAME, APP_NAME).expect("Unable to calculate project dirs");
     pub static ref CONFIG_DIR: &'static Path = PROJECT_DIRS.config_dir();
     pub static ref DATA_DIR: &'static Path = PROJECT_DIRS.data_dir();
+    /// Snapshots of local save files taken right before the engine overwrote
+    /// them with bytes the user had never uploaded. Kept next to `data.sqlite`
+    /// (which indexes them) so the two travel together for recovery.
+    pub static ref BACKUP_DIR: PathBuf = DATA_DIR.join("save-backups");
 
     // IDENTITY: resolved once at startup. Empty string means "couldn't tell".
     pub static ref USERNAME: String = whoami::username().unwrap_or_default();

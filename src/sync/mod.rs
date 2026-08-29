@@ -17,6 +17,7 @@ pub use hash::sha256_hex;
 pub use reconcile::{Action, reconcile};
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,7 @@ use notify_debouncer_full::{DebounceEventResult, RecommendedCache, new_debouncer
 
 use crate::api::{Client, GameInstance, SaveMeta, SyncEvent, SyncStream, Timestamp};
 use crate::config::{Config, PollInterval, UploadTrigger};
+use crate::constants::BACKUP_DIR;
 use crate::store::{InstanceRecord, QueuedUpload, Store};
 
 type FsWatcher = notify_debouncer_full::Debouncer<notify::RecommendedWatcher, RecommendedCache>;
@@ -360,14 +362,14 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
         }
         // Keep the server's copy: use the cached save, or fetch it.
         if let Some(remote) = self.remote.get(instance_id).cloned() {
-            self.pull(&book, &remote);
+            self.pull(&book, &remote, "conflict");
             return;
         }
         match self.client.saves(instance_id) {
             Ok(saves) => {
                 if let Some(remote) = saves.first() {
                     self.remote.insert(instance_id.to_owned(), remote.clone());
-                    self.pull(&book, remote);
+                    self.pull(&book, remote, "conflict");
                 }
             }
             Err(e) if e.is_unauthorized() => self.emit(EngineEvent::SessionExpired),
@@ -407,7 +409,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
                     self.store_write(Store::write(|s| s.record_synced(id, &remote.content_hash, &remote.id)));
                 }
             }
-            Action::Pull => self.pull(book, remote.expect("reconcile only returns Pull when there is a remote save")),
+            Action::Pull => self.pull(book, remote.expect("reconcile only returns Pull when there is a remote save"), "pull"),
             Action::Push => self.push(book, force_push),
             Action::Conflict => {
                 let local_hash = local.hash().unwrap_or_default().to_owned();
@@ -418,7 +420,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
         }
     }
 
-    fn pull(&self, book: &InstanceRecord, remote: &SaveMeta) {
+    fn pull(&self, book: &InstanceRecord, remote: &SaveMeta, reason: &'static str) {
         let id = &book.game_instance_id;
         let bytes = match self.client.download_save(id, &remote.id) {
             Ok(bytes) => bytes,
@@ -432,11 +434,51 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
         if got != remote.content_hash {
             return self.emit(EngineEvent::Error(format!("{id}: downloaded hash {got} != advertised {}", remote.content_hash)));
         }
+
+        // Never overwrite local bytes the user never uploaded without keeping a copy.
+        match self.guard_overwrite(book, &remote.content_hash, &remote.id, reason) {
+            Guard::Proceed => {}
+            Guard::Deferred => return tracing::debug!("{id}: save file busy, deferring pull"),
+            Guard::Aborted => return,
+        }
+
         if let Err(e) = write_atomic(&book.save_path, &bytes) {
             return self.emit(EngineEvent::Error(format!("write {}: {e}", book.save_path.display())));
         }
         self.store_write(Store::write(|s| s.record_synced(id, &remote.content_hash, &remote.id)));
         self.emit(EngineEvent::Pulled { instance_id: id.clone() });
+    }
+
+    /// Snapshot the current on-disk save before a pull writes over it, when the
+    /// bytes are novel: not what we're about to write, and not the last thing we
+    /// uploaded. `last_synced_hash` is deliberately *not* trusted here, since the
+    /// map-time "use the server's copy" path seeds it to the local hash for bytes
+    /// that were never sent anywhere.
+    fn guard_overwrite(&self, book: &InstanceRecord, incoming_hash: &str, server_save_id: &str, reason: &'static str) -> Guard {
+        let bytes = match disk::read_bytes(&book.save_path) {
+            Ok(Some(bytes)) if !bytes.is_empty() => bytes,
+            Ok(_) => return Guard::Proceed, // nothing on disk to keep
+            Err(e) if disk::is_locked(&e) => return Guard::Deferred,
+            Err(e) => {
+                self.emit(EngineEvent::Error(format!("backup read {}: {e}", book.save_path.display())));
+                return Guard::Aborted;
+            }
+        };
+        let hash = sha256_hex(&bytes);
+        if !needs_backup(&hash, incoming_hash, book.last_uploaded_hash.as_deref()) {
+            return Guard::Proceed;
+        }
+        if let Err(e) = write_backup_blob(&BACKUP_DIR, &hash, &bytes) {
+            self.emit(EngineEvent::Error(format!("backup {}: {e}", book.save_path.display())));
+            return Guard::Aborted;
+        }
+        let record = Store::write(|s| s.insert_backup(&book.game_instance_id, &book.save_path, &hash, bytes.len() as u64, incoming_hash, Some(server_save_id), reason));
+        if let Err(e) = record {
+            self.emit(EngineEvent::Error(format!("backup record: {e:#}")));
+            return Guard::Aborted;
+        }
+        tracing::info!("kept a backup of {} before overwrite ({reason})", book.save_path.display());
+        Guard::Proceed
     }
 
     /// Local file is ahead of the server. Upload it (unless `manual` and not
@@ -572,6 +614,34 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
     }
 }
 
+/// Outcome of [`Worker::guard_overwrite`].
+enum Guard {
+    /// Safe to overwrite: nothing worth keeping, or a snapshot is stored.
+    Proceed,
+    /// The file is locked (an emulator has it); skip and retry next round.
+    Deferred,
+    /// The snapshot failed; abort rather than lose bytes.
+    Aborted,
+}
+
+/// Whether the local bytes need snapshotting before an overwrite: novel unless
+/// they're what we're about to write, or the last thing we uploaded (either way
+/// they're recoverable).
+fn needs_backup(local_hash: &str, incoming_hash: &str, last_uploaded: Option<&str>) -> bool {
+    local_hash != incoming_hash && last_uploaded != Some(local_hash)
+}
+
+/// Write pre-overwrite bytes to `dir/<hash>`. Content-addressed, so identical
+/// bytes are stored once; an existing blob is left alone.
+fn write_backup_blob(dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(hash);
+    if path.exists() {
+        return Ok(());
+    }
+    write_atomic(&path, bytes)
+}
+
 /// A best-effort `SaveMeta` for a save we just uploaded, before the stream's
 /// catch-up hands us the server's real row (with the real `uploaded_at`).
 fn synthetic_save(save_id: &str, hash: &str, size: u64) -> SaveMeta {
@@ -637,5 +707,34 @@ mod tests {
         assert_eq!(s.size_bytes, 4096);
         assert!(!s.starred);
         assert!(time::parse_utc(s.uploaded_at.as_str()).is_some());
+    }
+
+    #[test]
+    fn needs_backup_only_for_bytes_we_cant_recover() {
+        // novel local bytes about to be replaced: keep them
+        assert!(needs_backup("local", "incoming", None));
+        assert!(needs_backup("local", "incoming", Some("something-else")));
+        // already equal to what we're writing: nothing lost
+        assert!(!needs_backup("same", "same", None));
+        // it's the last thing we uploaded: recoverable from the server
+        assert!(!needs_backup("local", "incoming", Some("local")));
+    }
+
+    #[test]
+    fn write_backup_blob_is_content_addressed_and_idempotent() {
+        let dir = std::env::temp_dir().join(format!("coincell-backup-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        write_backup_blob(&dir, "hash-a", b"first").unwrap();
+        assert_eq!(fs::read(dir.join("hash-a")).unwrap(), b"first");
+
+        // a second call for the same hash leaves the existing blob untouched
+        write_backup_blob(&dir, "hash-a", b"different bytes, same name").unwrap();
+        assert_eq!(fs::read(dir.join("hash-a")).unwrap(), b"first");
+
+        write_backup_blob(&dir, "hash-b", b"second").unwrap();
+        assert_eq!(fs::read(dir.join("hash-b")).unwrap(), b"second");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

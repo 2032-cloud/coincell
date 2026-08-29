@@ -124,8 +124,9 @@ Two files, different lifecycles:
   `game_instance_id` mappings and per-instance pause flags; per-instance sync
   bookkeeping (last-synced hash / save id, last uploaded hash); the offline
   upload queue; the last-stream-position timestamp (`SyncStream`'s cursor);
-  conflict markers; and a launch-time cache of each console's `validSaveSizes`.
-  Rebuildable from the backend without losing user intent.
+  conflict markers; a launch-time cache of each console's `validSaveSizes`; and
+  the `save_backups` index (see Overwrite guard). Rebuildable from the backend
+  without losing user intent.
 
 <!-- putting watch bookkeeping in config.toml would mean the user's editor fights
      the daemon's writes, and a corrupt state file would nuke their preferences -->
@@ -433,10 +434,12 @@ Any List card click → `Mode::Detail(DetailState)`. Shows art + name + console,
 
 ### Not built yet
 
-- **Save history** - on demand, `client.saves(id)`, sorted client-side; restore
-  an older / starred save to disk. Would go on the detail page. Needs a
-  `Control::Restore { instance_id, save_id, content_hash }` on the engine
-  (download-on-worker).
+- **Save history + restore** - on demand, `client.saves(id)`, sorted
+  client-side; restore an older / starred **server** save to disk. Would go on
+  the detail page. Needs a `Control::Restore { instance_id, save_id,
+  content_hash }` on the engine (download-on-worker, through the same overwrite
+  guard). Separately, a UI onto the `save_backups` the guard already collects
+  (list / restore a pre-overwrite local snapshot) once its shape is decided.
 
 <!-- TODO (backend): `/api/events` only pushes `{type:"save",instanceId}`. Add a
      `{type:"instance",…}` (created / renamed / deleted) push so Home's catalog
@@ -589,8 +592,9 @@ epoch helper) and picks the side; if the file has no mtime it falls back to
 
 Acting on each:
 
-- `Pull` - `client.download_save(id, remote.id)` → `disk::write_atomic` →
-  `Store::record_synced(id, remote_hash, remote.id)` → `EngineEvent::Pulled`.
+- `Pull` - `client.download_save(id, remote.id)` → **overwrite guard** (below) →
+  `disk::write_atomic` → `Store::record_synced(id, remote_hash, remote.id)` →
+  `EngineEvent::Pulled`.
 - `MarkSynced` - bytes already match the server; `record_synced` only, no write,
   no event.
 - `Push` - `push()` (Upload direction, below): upload the bytes → `Pushed`, or
@@ -604,6 +608,25 @@ Instances that are **paused** (`InstanceRecord::paused`) or **not bound** in the
 store are skipped before `reconcile` is even called. `missing + synced == remote`
 is `Idle` (the user deleted a synced save; don't fight them - a manual
 "restore" in Home re-pulls).
+
+### Overwrite guard **[BUILT]**
+
+`pull` never writes the server's bytes over local bytes the user hasn't uploaded
+without keeping a copy first. `Worker::guard_overwrite(book, incoming_hash,
+server_save_id, reason)` reads the current file and, if
+`needs_backup(local_hash, incoming_hash, last_uploaded_hash)` (local differs from
+what we're about to write **and** isn't the last thing we pushed), writes the
+bytes to `BACKUP_DIR/<local_hash>` (content-addressed, `DATA_DIR/save-backups/`,
+next to `data.sqlite`) and indexes them in `save_backups`
+(`game_instance_id`, `original_path`, `content_hash`, `size`, `replaced_with`,
+`server_save_id`, `reason` = `"pull"` / `"conflict"`, `overwritten_at`). It
+returns `Deferred` if the file is locked (retry next round) and `Aborted` (with
+an `Error`) if the snapshot can't be written - the pull is skipped rather than
+lose bytes. `last_synced_hash` is **not** consulted: the map-time "use the
+server's copy" path seeds it to the local hash for bytes that were never sent.
+`save_backups` has **no FK / cascade** to `instances` - a backup outlives an
+unmap. Not built yet: any pruning (the dir grows unbounded; saves are tiny) and
+any UI or restore path.
 
 ### Event handling
 

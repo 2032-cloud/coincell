@@ -77,6 +77,24 @@ const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     ",
+    // v1 -> v2: snapshots of a local save taken right before the engine
+    // overwrote it with bytes the user had never uploaded. No FK to `instances`:
+    // a backup must outlive an unmap (that's the whole point).
+    "
+    CREATE TABLE save_backups (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_instance_id TEXT NOT NULL,
+        original_path    TEXT NOT NULL,
+        content_hash     TEXT NOT NULL,
+        size_bytes       INTEGER NOT NULL,
+        replaced_with    TEXT NOT NULL,
+        server_save_id   TEXT,
+        reason           TEXT NOT NULL,
+        overwritten_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX ix_save_backups_instance ON save_backups(game_instance_id);
+    ",
 ];
 
 const CURSOR_KEY: &str = "sync_cursor";
@@ -127,9 +145,48 @@ pub struct QueuedUpload {
     pub last_attempt_at: Option<String>,
 }
 
+/// A snapshot of a local save file the engine kept right before overwriting it
+/// with bytes the user had never uploaded, so the overwrite is always
+/// recoverable. The bytes live at `BACKUP_DIR/<content_hash>`; this is the index
+/// entry. No UI reads these yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveBackup {
+    pub id: i64,
+    pub game_instance_id: String,
+    /// The local file that was overwritten.
+    pub original_path: PathBuf,
+    /// `content_hash` of the backed-up bytes; also the blob's filename.
+    pub content_hash: String,
+    pub size_bytes: u64,
+    /// `content_hash` of the save that replaced it.
+    pub replaced_with: String,
+    /// The replacing save's server id, if it was known.
+    pub server_save_id: Option<String>,
+    /// What triggered the overwrite, e.g. `"pull"` / `"conflict"`.
+    pub reason: String,
+    /// `YYYY-MM-DD HH:MM:SS` UTC, stamped by SQLite.
+    pub overwritten_at: String,
+}
+
 const INSTANCE_COLS: &str = "game_instance_id, save_path, console_slug, paused, \
      last_synced_hash, last_synced_save_id, last_uploaded_hash, \
      conflict_local_hash, conflict_remote_hash, conflict_detected_at";
+
+const BACKUP_COLS: &str = "id, game_instance_id, original_path, content_hash, size_bytes, replaced_with, server_save_id, reason, overwritten_at";
+
+fn map_backup(row: &Row) -> rusqlite::Result<SaveBackup> {
+    Ok(SaveBackup {
+        id: row.get(0)?,
+        game_instance_id: row.get(1)?,
+        original_path: PathBuf::from(row.get::<_, String>(2)?),
+        content_hash: row.get(3)?,
+        size_bytes: row.get::<_, i64>(4)? as u64,
+        replaced_with: row.get(5)?,
+        server_save_id: row.get(6)?,
+        reason: row.get(7)?,
+        overwritten_at: row.get(8)?,
+    })
+}
 
 fn map_instance(row: &Row) -> rusqlite::Result<InstanceRecord> {
     let save_path: String = row.get(1)?;
@@ -320,6 +377,32 @@ impl Store {
             params![id],
         )?;
         Ok(())
+    }
+
+    // ---- pre-overwrite save backups ----------------------------------
+
+    /// Index a snapshot the engine just wrote to `BACKUP_DIR/<content_hash>`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_backup(&self, id: &str, original_path: &Path, content_hash: &str, size_bytes: u64, replaced_with: &str, server_save_id: Option<&str>, reason: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO save_backups
+                 (game_instance_id, original_path, content_hash, size_bytes, replaced_with, server_save_id, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, original_path.to_string_lossy(), content_hash, size_bytes as i64, replaced_with, server_save_id, reason],
+        )?;
+        Ok(())
+    }
+
+    /// Every snapshot, newest first.
+    pub fn backups(&self) -> rusqlite::Result<Vec<SaveBackup>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {BACKUP_COLS} FROM save_backups ORDER BY overwritten_at DESC, id DESC"))?;
+        stmt.query_map([], map_backup)?.collect()
+    }
+
+    /// Snapshots for one instance, newest first.
+    pub fn backups_for(&self, id: &str) -> rusqlite::Result<Vec<SaveBackup>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {BACKUP_COLS} FROM save_backups WHERE game_instance_id = ?1 ORDER BY overwritten_at DESC, id DESC"))?;
+        stmt.query_map(params![id], map_backup)?.collect()
     }
 
     // ---- stream cursor ------------------------------------------------
@@ -648,6 +731,31 @@ mod tests {
         store.unbind_instance("i").unwrap();
         assert!(store.instance("i").unwrap().is_none());
         assert!(store.queued_uploads().unwrap().is_empty(), "queue rows cascade-delete with their instance");
+    }
+
+    #[test]
+    fn save_backups_round_trip_and_outlive_the_instance() {
+        let store = mem();
+        store.bind_instance("i", Path::new("/saves/g.srm"), None).unwrap();
+        store.bind_instance("j", Path::new("/saves/h.srm"), None).unwrap();
+
+        store.insert_backup("i", Path::new("/saves/g.srm"), "local1", 8192, "server1", Some("save-1"), "pull").unwrap();
+        store.insert_backup("i", Path::new("/saves/g.srm"), "local2", 8192, "server2", None, "conflict").unwrap();
+        store.insert_backup("j", Path::new("/saves/h.srm"), "other", 4096, "srv", Some("save-9"), "pull").unwrap();
+
+        let for_i = store.backups_for("i").unwrap();
+        assert_eq!(for_i.len(), 2);
+        assert_eq!(for_i[0].content_hash, "local2", "newest first");
+        assert_eq!(for_i[0].replaced_with, "server2");
+        assert_eq!(for_i[0].server_save_id, None);
+        assert_eq!(for_i[0].reason, "conflict");
+        assert_eq!(for_i[1].server_save_id.as_deref(), Some("save-1"));
+        assert_eq!(store.backups().unwrap().len(), 3);
+
+        // a backup is a permanent record: unmapping the instance must not touch it
+        store.unbind_instance("i").unwrap();
+        assert!(store.instance("i").unwrap().is_none());
+        assert_eq!(store.backups_for("i").unwrap().len(), 2, "backups survive an unmap");
     }
 
     #[test]
