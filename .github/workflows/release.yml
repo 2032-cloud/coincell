@@ -1,0 +1,152 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag -a v0.2.0 -m v0.2.0 && git push origin v0.2.0
+# A plain vX.Y.Z tag -> a normal release (channel "stable").
+# A vX.Y.Z-rc.1 / -beta.2 style tag -> a GitHub pre-release (channel "prerelease").
+# build.rs reads the tag to stamp the binary; nothing else needs changing.
+#
+# PREREQUISITES (one-time, see design.md "Updater"):
+#   - assets/minisign.pub committed to the repo (the public verify key).
+#   - repo secret MINISIGN_SECRET_KEY = the full contents of the minisign secret
+#     key file (generated unencrypted with `rsign generate -W`).
+#   - (optional) repo secret MINISIGN_PASSWORD if the key IS password-protected;
+#     uncomment the stdin pipe in the Sign step below.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.rs stamps the binary from the tag, so a stale Cargo.toml won't ship
+      # a wrong version, but keep them in lockstep anyway (tarball builds, crates
+      # tooling, plain sanity). Fail here rather than drift silently.
+      - name: Cargo.toml version matches the tag
+        run: |
+          want="${GITHUB_REF_NAME#v}"; want="${want%%-*}"   # v1.2.0-rc.1 -> 1.2.0
+          have="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          echo "tag wants '$want', Cargo.toml has '$have'"
+          test "$want" = "$have" || {
+            echo "::error::Cargo.toml is $have but the tag is $want. Run 'cargo set-version $want' (or cargo-release), commit, delete this tag, re-tag."
+            exit 1
+          }
+
+      - name: Install Linux GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --locked
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: coincell.exe
+          # Built on 22.04 (glibc 2.35) for a lower runtime floor than
+          # ubuntu-latest. See design.md for the cargo-zigbuild plan to pin an
+          # even older glibc / add cross targets.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: coincell
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build.rs runs `git describe --exact-match` against the tag
+
+      - name: Install Linux GUI build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libwayland-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install rsign2 (minisign-compatible signer)
+        run: cargo install rsign2 --locked
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="coincell-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name" out
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$name/"
+          cp assets/Phosphor-LICENSE-MIT assets/NotoSansCJK-LICENSE "dist/$name/" 2>/dev/null || true
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd dist && 7z a -tzip "../out/$name.zip" "$name" >/dev/null)
+            echo "artifact=out/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -C dist -czf "out/$name.tar.gz" "$name"
+            echo "artifact=out/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set, see this workflow's header." >&2
+            exit 1
+          fi
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          art="${{ steps.package.outputs.artifact }}"
+          comment="coincell ${GITHUB_REF_NAME} ${{ matrix.target }}"
+          # Unencrypted key (rsign generate -W): no password needed.
+          rsign sign -s minisign.key -x "$art.minisig" -t "$comment" -c "$comment" "$art"
+          # Password-protected key instead? use:
+          #   printf '%s\n' "$MINISIGN_PASSWORD" | rsign sign -s minisign.key -x "$art.minisig" -t "$comment" "$art"
+          rm -f minisign.key
+          if [ -f assets/minisign.pub ]; then
+            rsign verify -p assets/minisign.pub -x "$art.minisig" "$art"
+          else
+            echo "::warning::assets/minisign.pub not committed yet, skipping the in-CI verify self-check."
+          fi
+          ( cd "$(dirname "$art")" && sha256sum "$(basename "$art")" > "$(basename "$art").sha256" )
+
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.artifact }}.minisig
+            ${{ steps.package.outputs.artifact }}.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

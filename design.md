@@ -14,8 +14,9 @@ the `data.sqlite` store (`src/store.rs`), branding-driven theming
 both directions, the filesystem watcher, the offline upload queue, conflict
 resolution, save-history restore), and the **Home window** (`src/app/home.rs` -
 the game list, local search, the add-game flow, the instance detail page, and the
-per-game save-history screen). Not started: the tray menu, versioning, the
-updater.
+per-game save-history screen), **build-time versioning** (`build.rs` +
+`src/version.rs`), and **CI + release workflows** (`.github/workflows/`, signed
+GitHub Releases on `v*` tags). Not started: the tray menu, the updater client.
 
 ## What coincell is
 
@@ -192,7 +193,7 @@ on_session_expired = true
 theme = "account"             # "account" (follow /api/me) | "auto" | "light" | "dark"
 
 [window]
-hide_on_focus_loss = false    # opt-in; — button + Esc + tray click always work
+hide_on_focus_loss = false    # opt-in;, button + Esc + tray click always work
 ui_scale = 1.0                 # egui zoom factor, clamped 0.5..=3.0
 
 [updates]
@@ -252,7 +253,7 @@ Rail sections:
    that fits here better than its own section) **hide the window when it loses
    focus** = `window.hide_on_focus_loss`. `start_hidden` **is** honoured: `App`
    starts in `WindowState::Hidden` and `App::reconcile_visibility` (see Window
-   behavior) sends `ViewportCommand::Visible(false)` on the first frames — eframe
+   behavior) sends `ViewportCommand::Visible(false)` on the first frames, eframe
    ignores `ViewportBuilder::with_visible` and force-shows once after the first
    paint, so re-asserting is what actually keeps it hidden.
    _(Launch-on-login still records the pref only; OS autostart not wired.)_
@@ -263,8 +264,10 @@ Rail sections:
    applied live via `src/theme.rs`, see Theme) and **UI scale**
    (`window.ui_scale`, a preset % combo). Scale is applied live too: `App::logic`
    pushes it to `ctx.set_zoom_factor` whenever it drifts from the stored value.
-6. **Updates** - current version (`CARGO_PKG_VERSION` for now), channel,
-   check-automatically, on-update action. _(No "Check now" - no updater yet.)_
+6. **Updates** - current version (`version::VERSION`, resolved from git at build
+   time - see Versioning; a "development build" note shows when
+   `!version::is_release()`), channel, check-automatically, on-update action.
+   _(No "Check now" - no updater yet.)_
 7. **Save backups** - every pre-overwrite local snapshot the engine has kept
    (`Store::backups()`), newest first, labelled by game (name resolved from the
    catalog, else the raw instance id + original path for a deleted game). This is
@@ -390,7 +393,7 @@ their emulator first, which guarantees the name, location and format are right,
 so there's no folder-plus-name guessing.
 
 - **Choose save file…** → `HomeOutcome::OpenSaveDialog`; `App` runs
-  `mapping::pick_save_file` on its own thread (see Window behavior — no freeze, no
+  `mapping::pick_save_file` on its own thread (see Window behavior, no freeze, no
   auto-hide), `HomeApp::deliver_save_pick` builds a `PickedSave` via `inspect`
   (or sets an error if the file can't be read, e.g. the emulator has it locked).
 - A pick whose size isn't in `validSaveSizes` (`describe_sizes` for the phrasing)
@@ -723,7 +726,7 @@ given duration).
   acted on, so this also picks up `Pull` / `Conflict` cases the download side
   would have handled.
 - `Action::Push` → `push()`: read the bytes (retry ~5×/250 ms if
-  `disk::is_locked` — Windows sharing violation / POSIX advisory lock), hash,
+  `disk::is_locked`, Windows sharing violation / POSIX advisory lock), hash,
   `client.upload_save` → `record_uploaded` + `record_synced(hash, new save id)`
   (disk and server agree now; also clears any conflict) + a **synthetic
   `SaveMeta`** in the cache with a "now" `uploaded_at` until the stream's
@@ -781,45 +784,127 @@ last-synced hash **and** the two differ (the `else` row of the table above).
 
 ## Versioning
 
-Not built (Config > Updates and the diagnostics copy show raw
-`CARGO_PKG_VERSION`). One version string, resolved at build time, to be used
-everywhere - Config > Updates, the diagnostics copy, Sentry `release`, the API
-`User-Agent`.
+**BUILT** (`build.rs` + `src/version.rs`). One version string, resolved from git
+at build time, used everywhere: Config › Updates, copy-diagnostics, the Sentry
+`release` + `environment`, and the device-API `User-Agent` (`constants::USER_AGENT`
+→ `api::set_user_agent` in `main`, applied by `api::client::http_client()` on
+every request the module makes).
 
-- **Release build** - HEAD sits exactly on a version tag and the tree is clean.
-  Version is that tag's semver (`0.2.0`); channel `stable`, or `prerelease` if
-  the tag says so. This is the only kind of build ever distributed.
-- **Development build** - anything else. Version is
-  `{CARGO_PKG_VERSION}+dev.{short_hash}` (`-dirty` suffix if the tree isn't
-  clean), channel **always `development`** regardless of `[updates].channel`.
-- A `build.rs` (or `vergen` / `shadow-rs`) resolves this from
-  `git describe --tags --dirty` / `git rev-parse`, emitted as a `rustc-env` var;
-  `CARGO_PKG_VERSION` is the fallback when git isn't available (source tarball).
-- The updater treats a `development` build as "never has an update to offer" —
-  it can still check and _show_ the latest release, but auto-install stays off.
-  Only `stable` / `prerelease` builds self-update.
+`build.rs` shells out to `git` and emits three `cargo:rustc-env` vars that
+`version.rs` re-exports as `pub const`s (`VERSION`, `CHANNEL`, `COMMIT`), plus
+`version::is_release()`:
+
+- **Release build** - HEAD sits exactly on a clean `vX.Y.Z` tag
+  (`git describe --tags --exact-match --match 'v[0-9]*'`, and
+  `git status --porcelain` empty). `VERSION` = the tag minus its `v`; `CHANNEL` =
+  `prerelease` if the semver has a pre-release segment (`v0.2.0-rc.1`), else
+  `stable`. The only kind of build ever distributed.
+- **Development build** - anything else. `VERSION` =
+  `{CARGO_PKG_VERSION}+dev.{short_hash}` (`-dirty` suffix when the tree isn't
+  clean), `CHANNEL` = `development`. No git at all (a source tarball) →
+  `VERSION` = bare `CARGO_PKG_VERSION`, `COMMIT` = `unknown`, still
+  `development`.
+- The updater treats a `development` build as "never has an update to offer" -
+  it can still check and _show_ the latest release, but auto-install stays off
+  (`version::is_release()` gates it). Config › Updates says as much under the
+  version line. Only `stable` / `prerelease` builds self-update.
+- `rerun-if-changed` on `build.rs`, `.git/HEAD`, `.git/index` - unstaged edits
+  won't refresh the `-dirty` marker, which is fine (dev builds aren't shipped).
+
+## Build & CI
+
+**BUILT** - `.github/workflows/ci.yml` + `release.yml`.
+
+Targets (two, x86-64 only for now):
+
+| Triple | Runner | Notes |
+| --- | --- | --- |
+| `x86_64-pc-windows-msvc` | `windows-latest` | The default Windows triple; best egui / tray-icon / rfd support. `windows_subsystem = "windows"` (already set for non-debug) hides the console. |
+| `x86_64-unknown-linux-gnu` | `ubuntu-22.04` | glibc 2.35 floor - lower than `ubuntu-latest`. Dynamically linked (a static-musl GUI build is fragile: winit still `dlopen`s X11/Wayland/GL). |
+
+Linux needs `libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+libxkbcommon-dev libwayland-dev` at build time (rfd + tray-icon + winit).
+Bundled `rusqlite` compiles SQLite from source - needs a C compiler, no system
+lib.
+
+- **`ci.yml`** - `push` to `main` + all PRs. Matrix `{ubuntu-latest,
+  windows-latest}`: `cargo fmt --check` (Linux only), `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo test`. These compile as `development`
+  builds; nothing is published.
+- **`release.yml`** - on a `v*` tag. A `test` job (which first asserts
+  `Cargo.toml`'s version equals the tag, minus any pre-release suffix - the
+  binary itself is stamped from the tag by `build.rs`, but the two are kept in
+  lockstep for tarball builds / tooling / sanity) gates a `build` matrix over
+  the two triples: `cargo build --release`, package (Windows `.zip`, Linux
+  `.tar.gz`), **minisign-sign** each archive (see Updater), emit a `.sha256`,
+  and attach archive + `.minisig` + `.sha256` to the GitHub Release via
+  `softprops/action-gh-release`. `prerelease: true` when the tag name contains a
+  `-` (so `v0.2.0-rc.1` → GitHub pre-release, and `build.rs` → `prerelease`
+  channel).
+- **Nightlies** - not a third channel, not per-push. If ever wanted, a scheduled
+  job cuts a `vX.Y.Z-nightly.<date>` pre-release when `main` moved; it rides the
+  existing `prerelease` channel and stays monotonic.
+- **Cutting a release** - `cargo release <patch|minor|major|rc> --execute`
+  (config in `release.toml`): bumps `Cargo.toml` + `Cargo.lock`, commits, tags
+  `vX.Y.Z`, pushes. The tag triggers `release.yml`. Never touch the GitHub
+  Releases UI or hand-edit the version. `release.toml` sets `publish = false` -
+  this is not a crates.io crate.
+
+**Future targets** (add as needs arise, roughly this order):
+
+- `cargo-zigbuild` to pin an older glibc (`x86_64-unknown-linux-gnu.2.31`)
+  without an old-distro container, and to cross-compile the rest from one Linux
+  runner.
+- macOS (`aarch64-apple-darwin` + `x86_64-apple-darwin`, or a universal binary) -
+  well supported by the stack, but needs codesigning + notarization to avoid
+  Gatekeeper friction, so it pairs with the signed-updater work.
+- `aarch64-unknown-linux-gnu` (ARM SBCs / servers), then
+  `aarch64-pc-windows-msvc` (Windows on ARM).
 
 ## Updater
 
 Built **last** - after everything else in this doc is realised. Nothing is
-distributed to anyone until then, so there's no installed base to migrate and the
-signing key can be generated right before the first real release.
+distributed to anyone until then, so there's no installed base to migrate.
 
-- Source: GitHub Releases for this repo (binaries attached per release). No mirror
+**Signing (minisign).** Detached `.minisig` per release archive, verified in-app
+with the `minisign-verify` crate (pure Rust, no libsodium). Chosen over cosign:
+tiny, offline, a short public key that bakes in as a `const`.
+
+- **Key**: an Ed25519 minisign keypair, generated once with `rsign2`
+  (`cargo install rsign2`; `rsign generate -W` for an unencrypted secret key -
+  fine because the secret only ever lives in a GitHub Actions secret and offline,
+  never on a build runner's disk beyond the signing step).
+- The **public** key is committed at `assets/minisign.pub` and baked into the
+  binary (`include_str!`, like `branding.json`). The **secret** key is the repo
+  secret `MINISIGN_SECRET_KEY` (whole file contents). `.gitignore` blocks
+  `minisign.key` / `*.sec`. (If the key is password-protected instead, add
+  `MINISIGN_PASSWORD` and uncomment the pipe in `release.yml`.)
+- `release.yml` signs each archive after building and uploads the `.minisig`
+  alongside it; it also self-verifies against `assets/minisign.pub` when that
+  file is present.
+
+**Update flow** (the client code, not yet written):
+
+- Source: GitHub Releases for this repo (archives attached per release). No mirror
   through the Worker.
 - Check: `GET /repos/<owner>/<repo>/releases/latest` (or `/releases` filtered for
-  the prerelease channel), semver-compare `tag_name` to the running version.
-  Unauthenticated GitHub API is 60 req/hr/IP - a 24 h check is nowhere near that;
-  back off on `403`.
-- Apply: download the asset for this OS/arch, **verify a detached signature
-  (minisign or cosign) against a public key baked into the binary** - planned
-  from the first distributed build, not optional - then self-replace. Windows
-  can't overwrite a running exe: rename self → drop new exe → spawn new → exit.
-  `self_update` / `self-replace` crates do most of this against GH Releases.
+  the prerelease channel per `[updates].channel`), semver-compare `tag_name` to
+  `version::VERSION`. `version::is_release()` must be true or the updater only
+  *shows* the latest, never installs. Unauthenticated GitHub API is 60 req/hr/IP
+  - a 24 h check is nowhere near that; back off on `403`.
+- Apply: download the archive for this OS/arch **and its `.minisig`**, verify the
+  signature against the baked-in public key (`minisign-verify`), check the
+  `.sha256`, unpack, then self-replace. Windows can't overwrite a running exe:
+  rename self → drop new exe → spawn new → exit. `self-replace` handles the
+  swap; `self_update` can do the GH Releases plumbing but rolls its own verify -
+  we verify ourselves before handing it the file.
 - Coordinate with the single-instance socket lock: the new process must wait for
   the old one to drop it. Sequence the handoff in `ipc`.
 - UI: `[updates].on_update` decides notify / auto-download / auto-install. The
   Config button walks **Check → Downloading → Install `vX.Y.Z` (restart)**.
+
+**New deps when this lands**: `minisign-verify`, `self-replace` (and maybe
+`self_update`), a small `tar` + `zip` / `flate2` unpack, `semver`.
 
 ## Logging & observability
 
@@ -838,9 +923,9 @@ signing key can be generated right before the first real release.
   `logging.rs`; the client only initialises when it's non-empty **and**
   `[advanced].crash_reports == Some(true)`, so the opt-in is respected. The
   `sentry_tracing` layer is always in the registry (a no-op with no client):
-  ERROR becomes a Sentry event, WARN/INFO become breadcrumbs. `release` is
-  `CARGO_PKG_VERSION` for now (TODO: real build version + `environment` = channel
-  once `build.rs` versioning lands). Toggling crash reports needs a restart.
+  ERROR becomes a Sentry event, WARN/INFO become breadcrumbs. `release` =
+  `version::VERSION`, `environment` = `version::CHANNEL` (see Versioning).
+  Toggling crash reports needs a restart.
 - **The opt-in gate IS built.** `[advanced].crash_reports` is tri-state:
   **absent** until answered. On the first `Ready`, if it's absent, `App` shows a
   one-time `egui::Modal` ("upload anonymous error reports?") and writes the
@@ -864,14 +949,14 @@ signing key can be generated right before the first real release.
   parks the `Receiver` in `App.pending_pick`, and hands the `PathBuf` back via
   `HomeApp::deliver_save_pick` once it lands. So the window
   neither freezes nor minimises while the dialog is up. On resolve `App` also
-  **re-arms `focus_latch`** — the dialog held focus and the OS can take a frame
+  **re-arms `focus_latch`**, the dialog held focus and the OS can take a frame
   or two returning it, which would otherwise read as a focus-loss auto-hide.
 - **Visibility is state-driven.** `hide()` / `show_home()` / `show_config()` only
   set `WindowState`; `App::reconcile_visibility` (end of every `logic()`) sends
   `ViewportCommand::Visible(!hidden)` when it drifts from the last one sent. For
   the first 3 frames it re-asserts unconditionally (and forces repaints) because
   eframe force-shows the window once after the first paint (anti-flash hack) and
-  ignores `ViewportBuilder::with_visible` — re-asserting is the only reliable way
+  ignores `ViewportBuilder::with_visible`, re-asserting is the only reliable way
   to honour `start_hidden`. The hidden branch of `ui()` still paints an empty
   `CentralPanel` so a briefly-shown window is themed-blank, never black.
 - `App` starts in `WindowState::Hidden` when `[startup].start_hidden`, else
@@ -889,8 +974,8 @@ signing key can be generated right before the first real release.
   `ConfigApp::reset()` / `HomeApp::on_reopen()` on every visible-state change.
   The one exception: `HomeApp::on_reopen()` **keeps** an unfinished `MapPrompt`
   (an instance was created server-side and still needs a mapping decision), so
-  minimising / switching away mid add-game — including with the off-thread file
-  picker still open — doesn't strand it. A native dialog can't be dismissed
+  minimising / switching away mid add-game, including with the off-thread file
+  picker still open, doesn't strand it. A native dialog can't be dismissed
   programmatically; the flow just resumes on reopen, and "I'll map it later" is
   always the way out.
 
@@ -1005,13 +1090,17 @@ None blocking. In rough build order:
    detail page (map an existing save, pause, unmap, sync-now, conflict picker),
    and the per-game save-history screen (server saves + local backups, restore /
    delete). Nothing left.
-3. `build.rs` versioning (Updates panel shows raw `CARGO_PKG_VERSION` today) -
-   also feeds Sentry `release` / `environment` and the API `User-Agent`.
-4. Multilingual game titles: names come pre-resolved from the server (per the
-   account's region); the client just bundles `NotoSansCJKjp-Regular.otf` so
-   non-Latin ones render. Done bar the license file.
-5. OS autostart registration; `[sync].upload_trigger` / `pause_on_metered`
-   behaviour. (Theme wiring is done - see Theme. Tray interaction is done, click
-   routing, see that section.)
-6. Launcher / process-watch model for "pull right before you play".
-7. Auto-updater + signing key - last; key generated just before first release.
+3. `build.rs` versioning - **DONE**. Wired into Config › Updates,
+   copy-diagnostics, Sentry `release` / `environment`, and the device-API
+   `User-Agent`.
+4. **CI + release workflows** - **DONE** (`.github/workflows/ci.yml` +
+   `release.yml`). Lint/test on push+PR; `v*` tags build the two triples, sign
+   with minisign, and publish a GitHub Release. See Build & CI.
+5. Multilingual game titles - **DONE**. Server-resolved names, `jp` CJK font
+   bundled, license in place, unused CJK otfs removed.
+6. OS autostart registration; `[sync].upload_trigger` / `pause_on_metered`
+   behaviour.
+7. Launcher / process-watch model for "pull right before you play".
+8. Auto-updater client - last. Signing (minisign) is set up in `release.yml`;
+   the user generates the keypair and sets `MINISIGN_SECRET_KEY` before the
+   first tag. See Updater.

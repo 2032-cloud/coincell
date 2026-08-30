@@ -13,6 +13,7 @@ mod store;
 mod sync;
 mod theme;
 mod tray;
+mod version;
 
 pub use constants::*;
 
@@ -34,8 +35,10 @@ fn main() -> anyhow::Result<()> {
 
     config::Config::init();
     let _log_guards = logging::init();
-    tracing::info!("CoinCell {} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("{} {} ({}) starting", constants::APP_NAME, version::VERSION, version::CHANNEL);
     store::Store::init();
+    // Stamp every device-API request with our version.
+    api::set_user_agent(USER_AGENT.as_str());
     // User-facing notifications only log for now. A real OS toast sink plugs in
     // here via `notice::set_sink(..)` once a backend is chosen.
 

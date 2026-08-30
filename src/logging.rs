@@ -81,8 +81,8 @@ fn init_sentry(opted_in: bool) -> Option<sentry::ClientInitGuard> {
         return None;
     }
     let mut options = sentry::ClientOptions::default();
-    // TODO: use the resolved build version + channel once build.rs versioning lands.
-    options.release = Some(env!("CARGO_PKG_VERSION").into());
+    options.release = Some(crate::version::VERSION.into());
+    options.environment = Some(crate::version::CHANNEL.into());
     options.send_default_pii = false;
     Some(sentry::init((SENTRY_DSN, options)))
 }

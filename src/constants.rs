@@ -37,6 +37,11 @@ lazy_static! {
     /// showing a placeholder: no hostname -> `CoinCell - ethan - Windows`,
     /// no username either -> `CoinCell - Windows`.
     pub static ref CLIENT_NAME: String = build_client_name();
+
+    /// `User-Agent` on every device-API request, e.g.
+    /// `CoinCell/0.2.0 (stable; windows)`. Version + channel resolved at build
+    /// time (see `crate::version`).
+    pub static ref USER_AGENT: String = format!("{APP_NAME}/{} ({}; {})", crate::version::VERSION, crate::version::CHANNEL, std::env::consts::OS);
 }
 
 fn build_client_name() -> String {

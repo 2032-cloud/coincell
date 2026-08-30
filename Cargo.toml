@@ -31,3 +31,9 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 sentry = { version = "0.49.2", default-features = false, features = ["backtrace", "contexts", "panic", "tracing", "reqwest", "rustls"] }
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
+
+[profile.release]
+strip = "symbols"   # smaller binaries; Sentry still gets frames from its own backtrace capture
+lto = "thin"
+codegen-units = 1
+# panic left at "unwind" on purpose, the Sentry panic hook needs it.

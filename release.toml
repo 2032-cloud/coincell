@@ -1,0 +1,11 @@
+# cargo-release config. Drive releases with `cargo release <patch|minor|major|rc>
+# --execute`: it bumps Cargo.toml + Cargo.lock, commits, tags vX.Y.Z, and pushes.
+# The pushed tag then triggers .github/workflows/release.yml, which builds, signs
+# (minisign), and publishes the GitHub Release. build.rs stamps the binary from
+# the tag; the CI `test` job asserts Cargo.toml matches it.
+
+publish = false                              # not a crates.io crate, never `cargo publish`
+push = true                                  # push the release commit + tag (default, explicit)
+tag-name = "v{{version}}"                     # matches release.yml's `v*` trigger and build.rs's `v[0-9]*`
+tag-message = "coincell {{version}}"
+pre-release-commit-message = "release: {{version}}"

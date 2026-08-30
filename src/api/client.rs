@@ -1,12 +1,31 @@
 //! Blocking REST client for the device API. One `Client` = one base URL + one
 //! session id. Cheap to `clone` (shared `reqwest` pool inside).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reqwest::blocking::RequestBuilder;
 
 use crate::api::models::{Consoles, GameInstances, Games, IdOnly, Saves, Upload};
 use crate::api::{Branding, Console, DeviceConfig, Error, Game, GameInstance, Me, NewGameInstance, Result, SaveMeta, expect_no_content, read_json};
+
+static USER_AGENT: OnceLock<String> = OnceLock::new();
+
+/// Set the `User-Agent` sent on every request from this module. Call once at
+/// startup, before the first request; later calls are ignored. Without it,
+/// requests carry `reqwest`'s default agent.
+pub fn set_user_agent(ua: impl Into<String>) {
+    let _ = USER_AGENT.set(ua.into());
+}
+
+/// A blocking client carrying the configured `User-Agent` (if [`set_user_agent`]
+/// ran). Shared by [`Client`] and the session-less free functions.
+pub(super) fn http_client() -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder();
+    if let Some(ua) = USER_AGENT.get() {
+        builder = builder.user_agent(ua);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
 
 /// Result of `POST /api/game-instances/:id/saves`.
 #[derive(Debug, Clone)]
@@ -26,7 +45,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(base: impl Into<Arc<str>>, session: impl Into<Arc<str>>) -> Self {
-        Self { base: normalise_base(base.into()), session: session.into(), http: reqwest::blocking::Client::new() }
+        Self { base: normalise_base(base.into()), session: session.into(), http: http_client() }
     }
 
     /// A copy pointed at a different session (e.g. right after a fresh login).
@@ -128,7 +147,7 @@ impl Client {
 /// `GET /auth/device/config`: no session required, so it's a free function, not
 /// a [`Client`] method (you need its result before you can build a `Client`).
 pub fn fetch_device_config(api_base: &str) -> Result<DeviceConfig> {
-    let http = reqwest::blocking::Client::new();
+    let http = http_client();
     let url = format!("{}/auth/device/config", api_base.trim_end_matches('/'));
     read_json(http.get(url).send()?)
 }
@@ -137,7 +156,7 @@ pub fn fetch_device_config(api_base: &str) -> Result<DeviceConfig> {
 /// it before (or without) a `Client`, e.g. to theme the sign-in screen. Callers
 /// fall back to the baked copy on any error.
 pub fn fetch_branding(api_base: &str) -> Result<Branding> {
-    let http = reqwest::blocking::Client::new();
+    let http = http_client();
     let url = format!("{}/api/branding", api_base.trim_end_matches('/'));
     read_json(http.get(url).send()?)
 }

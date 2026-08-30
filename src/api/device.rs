@@ -50,7 +50,7 @@ impl DeviceFlow {
 }
 
 fn run_flow(cfg: &DeviceConfig, client_name: &str, tx: &Sender<DeviceEvent>, wake: &impl Fn()) -> Result<()> {
-    let http = reqwest::blocking::Client::new();
+    let http = super::client::http_client();
 
     let device = request_device_code(&http, cfg)?;
     let _ = tx.send(DeviceEvent::AwaitingApproval {

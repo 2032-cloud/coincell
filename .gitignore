@@ -1,1 +1,7 @@
 /target
+
+# minisign signing: the SECRET key must never be committed (it lives in a
+# GitHub Actions secret and offline). The PUBLIC key at assets/minisign.pub is
+# meant to be in the repo.
+/minisign.key
+*.sec

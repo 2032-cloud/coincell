@@ -596,7 +596,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.state.hidden() {
             // Paint a valid (blank, themed) frame so a window that's momentarily
-            // shown — e.g. during the first-frame settle — is never just black.
+            // shown, e.g. during the first-frame settle, is never just black.
             egui::CentralPanel::default().show(ui, |_| {});
             ui.ctx().request_repaint_after(Duration::from_millis(250));
             return;

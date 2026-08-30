@@ -13,7 +13,7 @@ mod events;
 mod models;
 mod sync;
 
-pub use client::{Client, UploadOutcome, fetch_branding, fetch_device_config};
+pub use client::{Client, UploadOutcome, fetch_branding, fetch_device_config, set_user_agent};
 pub use device::{DeviceEvent, DeviceFlow, SessionCheck, SessionStatus, open_in_browser, revoke_in_background};
 pub use error::{Error, Result};
 pub use events::{EventStream, StreamEvent};

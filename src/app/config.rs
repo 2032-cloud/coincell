@@ -349,8 +349,11 @@ impl ConfigApp {
 
         ui.horizontal(|ui| {
             ui.label("Current version");
-            ui.monospace(env!("CARGO_PKG_VERSION"));
+            ui.monospace(crate::version::VERSION);
         });
+        if !crate::version::is_release() {
+            ui.small("Development build, auto-update is disabled. Channel and actions below apply to release builds.");
+        }
         ui.add_space(6.0);
 
         egui::Grid::new("updates_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -593,8 +596,10 @@ fn confirm(ui: &mut egui::Ui, prompt: &str, affirm: &str) -> Option<bool> {
 fn diagnostics() -> String {
     let (signed_in, level) = Config::get(|c| (c.session_id().is_some(), c.advanced.log_level));
     format!(
-        "CoinCell {ver}\nOS: {os} {arch}\nConfig: {cfg}\nData: {data}\nLogs: {logs}\nLog level: {level:?}\nSigned in: {signed_in}",
-        ver = env!("CARGO_PKG_VERSION"),
+        "CoinCell {ver} ({channel}, {commit})\nOS: {os} {arch}\nConfig: {cfg}\nData: {data}\nLogs: {logs}\nLog level: {level:?}\nSigned in: {signed_in}",
+        ver = crate::version::VERSION,
+        channel = crate::version::CHANNEL,
+        commit = crate::version::COMMIT,
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         cfg = crate::constants::CONFIG_DIR.display(),
