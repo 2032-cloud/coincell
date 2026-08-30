@@ -12,6 +12,14 @@ pub const CHANNEL: &str = env!("COINCELL_CHANNEL");
 /// Short commit hash, or `"unknown"` when built without git.
 pub const COMMIT: &str = env!("COINCELL_COMMIT");
 
+/// The exact target triple this binary was built for, e.g.
+/// `x86_64-pc-windows-msvc`. Used by the updater to pick the matching release
+/// asset (`coincell-vX.Y.Z-<triple>.{zip,tar.gz}`).
+pub const TARGET: &str = env!("COINCELL_TARGET");
+
+/// `owner/repo` whose GitHub Releases the updater checks.
+pub const REPO: &str = "2032-cloud/coincell";
+
 /// Whether this build is eligible to self-update (i.e. not a `development` one).
 pub fn is_release() -> bool {
     CHANNEL != "development"

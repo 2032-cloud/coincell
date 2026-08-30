@@ -5,6 +5,7 @@ mod app;
 mod asset;
 mod config;
 mod constants;
+mod install;
 mod ipc;
 mod logging;
 mod notice;
@@ -13,11 +14,13 @@ mod store;
 mod sync;
 mod theme;
 mod tray;
+mod update;
 mod version;
 
 pub use constants::*;
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use app::App;
 use ipc::Instance;
@@ -28,7 +31,21 @@ fn main() -> anyhow::Result<()> {
     // whole process before any TLS happens.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let wake_rx = match ipc::acquire()? {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    // `coincell --uninstall [--purge]`, invoked by the Add/Remove Programs entry
+    // and the Config button. Runs regardless of a running instance.
+    if has("--uninstall") {
+        config::Config::init();
+        let _g = logging::init();
+        return install::uninstall(has("--purge"));
+    }
+
+    // A fresh self-update spawned us with this flag; wait out the old process's
+    // single-instance lock instead of instantly bailing as a secondary.
+    let acquired = if has("--relaunched-after-update") { ipc::acquire_wait(Duration::from_secs(8))? } else { ipc::acquire()? };
+    let wake_rx = match acquired {
         Instance::Primary(wake_rx) => wake_rx,
         Instance::Secondary => return Ok(()),
     };

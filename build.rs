@@ -8,6 +8,8 @@
 //!   pre-release segment), or `development` (everything else). The updater only
 //!   self-updates the first two.
 //! - `COINCELL_COMMIT` - short commit hash, or `unknown` when built without git.
+//! - `COINCELL_TARGET` - the exact target triple (`std::env::var("TARGET")`), so
+//!   the updater can pick the matching release asset by name.
 
 use std::process::Command;
 
@@ -25,6 +27,7 @@ fn main() {
     println!("cargo:rustc-env=COINCELL_VERSION={version}");
     println!("cargo:rustc-env=COINCELL_CHANNEL={channel}");
     println!("cargo:rustc-env=COINCELL_COMMIT={commit}");
+    println!("cargo:rustc-env=COINCELL_TARGET={}", std::env::var("TARGET").unwrap_or_else(|_| "unknown".into()));
 }
 
 /// Run `git` with `args`; `None` if git is missing, not a repo, or the command

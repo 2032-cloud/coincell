@@ -16,7 +16,9 @@ resolution, save-history restore), and the **Home window** (`src/app/home.rs` -
 the game list, local search, the add-game flow, the instance detail page, and the
 per-game save-history screen), **build-time versioning** (`build.rs` +
 `src/version.rs`), and **CI + release workflows** (`.github/workflows/`, signed
-GitHub Releases on `v*` tags). Not started: the tray menu, the updater client.
+GitHub Releases on `v*` tags), **self-install** (`src/install.rs`), and the
+**self-updater** (`src/update.rs`, manual "check for updates" so far). Not
+started: the tray menu, automatic update checks, the OS-toast notification sink.
 
 ## What coincell is
 
@@ -249,14 +251,16 @@ Rail sections:
    pause-on-metered, and a **Sync now** button (`ConfigOutcome::SyncNow` →
    `SyncEngine::sync_now`), disabled when `enabled` is off. _(No live status line
    yet - the engine emits `EngineEvent::Status` but Home isn't built to show it.)_
-3. **Startup** - launch on login, start hidden, and (a stray `[window]` toggle
-   that fits here better than its own section) **hide the window when it loses
-   focus** = `window.hide_on_focus_loss`. `start_hidden` **is** honoured: `App`
-   starts in `WindowState::Hidden` and `App::reconcile_visibility` (see Window
-   behavior) sends `ViewportCommand::Visible(false)` on the first frames, eframe
-   ignores `ViewportBuilder::with_visible` and force-shows once after the first
-   paint, so re-asserting is what actually keeps it hidden.
-   _(Launch-on-login still records the pref only; OS autostart not wired.)_
+3. **Startup** - an **install / uninstall** block (see Install), launch on
+   login, start hidden, and (a stray `[window]` toggle that fits here better
+   than its own section) **hide the window when it loses focus** =
+   `window.hide_on_focus_loss`. `start_hidden` **is** honoured: `App` starts in
+   `WindowState::Hidden` and `App::reconcile_visibility` (see Window behavior)
+   sends `ViewportCommand::Visible(false)` on the first frames, eframe ignores
+   `ViewportBuilder::with_visible` and force-shows once after the first paint, so
+   re-asserting is what actually keeps it hidden. The launch-on-login checkbox
+   now calls `install::set_autostart` (HKCU Run value / `~/.config/autostart`
+   `.desktop`); it only bites once CoinCell is installed.
 4. **Notifications** - master toggle + the four per-event toggles (disabled while
    the master is off). These gate `notice::post` (see Notifications); delivery
    itself is still log-only.
@@ -266,8 +270,11 @@ Rail sections:
    pushes it to `ctx.set_zoom_factor` whenever it drifts from the stored value.
 6. **Updates** - current version (`version::VERSION`, resolved from git at build
    time - see Versioning; a "development build" note shows when
-   `!version::is_release()`), channel, check-automatically, on-update action.
-   _(No "Check now" - no updater yet.)_
+   `!version::is_release()`), channel, check-automatically, on-update action, a
+   **Check for updates** button + status line, and a **Download & install**
+   button once a newer release is found. Drives `App::updater` (see Updater).
+   _(Automatic checks on `check_interval` and the `on_update` = download/install
+   actions aren't wired yet - the button is manual-only.)_
 7. **Save backups** - every pre-overwrite local snapshot the engine has kept
    (`Store::backups()`), newest first, labelled by game (name resolved from the
    catalog, else the raw instance id + original path for a deleted game). This is
@@ -562,6 +569,10 @@ right click opens/focuses **Config** (`Menu::new()` stays empty). Both buttons
 are load-bearing and in use, so a `tray-icon` popup menu is not planned. Sync
 now / Pause sync / Quit all live in the Config UI, which right click reaches in
 one action.
+
+`src/tray/` splits by platform: `ui_thread.rs` (Windows/macOS, icon built on the
+event-loop thread) and `gtk.rs` (Linux/BSD, a dedicated thread running a GTK
+main loop - needs the `gtk` crate, a Linux-target dependency).
 
 ## Sync engine
 
@@ -861,10 +872,39 @@ lib.
 - `aarch64-unknown-linux-gnu` (ARM SBCs / servers), then
   `aarch64-pc-windows-msvc` (Windows on ARM).
 
+## Install
+
+**BUILT** (`src/install.rs`). Self-install as a *mode of the one binary*, not a
+separate installer exe. Puts the binary somewhere stable (so `self-replace` can
+swap it) and registers it per-user, no admin.
+
+- `canonical_exe()` - Windows `%LOCALAPPDATA%\Programs\CoinCell\coincell.exe`,
+  Linux `~/.local/bin/coincell`. `running_installed()` / `is_installed()` gate
+  the UI.
+- `install()` - copy self there (renaming a busy target aside first, the same
+  trick the updater uses), then `register()`: Windows writes an Add/Remove
+  Programs key (`HKCU\...\Uninstall\CoinCell`, `UninstallString` = `"<exe>"
+  --uninstall`) and, per `[startup].launch_on_login`, the `HKCU\...\Run` value;
+  Linux writes a menu `.desktop` under `~/.local/share/applications`, the icon
+  under `hicolor/128x128`, and (when enabled) an `~/.config/autostart` entry.
+- `uninstall(purge)` - undo all of it; `purge` also deletes config / db / logs /
+  cache. The binary goes last (`self_replace::self_delete()` schedules it on
+  Windows; plain `remove_file` on Unix). Reachable from the ARP entry
+  (`coincell --uninstall [--purge]`, dispatched in `main` before the
+  single-instance check) and a confirm button in Config › Startup.
+- `set_autostart(bool)` - the standalone toggle the launch-on-login checkbox
+  calls.
+- **Deferred to the notification work**: a Windows Start Menu shortcut carrying
+  an AppUserModelID (needed for toasts to render as "CoinCell" and relaunch from
+  an actioned toast). `register()` has a TODO marker where it goes. A first-run
+  "install me?" prompt is also still TODO - for now you install from Config.
+
 ## Updater
 
-Built **last** - after everything else in this doc is realised. Nothing is
-distributed to anyone until then, so there's no installed base to migrate.
+**STARTED** (`src/update.rs` + `src/app` wiring). Check + download + verify +
+swap + relaunch all work, driven by a **Check for updates** button in Config ›
+Updates. Not yet wired: automatic checks on `[updates].check_interval`, and the
+`[updates].on_update` = download / install actions (the button is manual-only).
 
 **Signing (minisign).** Detached `.minisig` per release archive, verified in-app
 with the `minisign-verify` crate (pure Rust, no libsodium). Chosen over cosign:
@@ -883,28 +923,34 @@ tiny, offline, a short public key that bakes in as a `const`.
   alongside it; it also self-verifies against `assets/minisign.pub` when that
   file is present.
 
-**Update flow** (the client code, not yet written):
+**Update flow** (`src/update.rs`):
 
-- Source: GitHub Releases for this repo (archives attached per release). No mirror
-  through the Worker.
-- Check: `GET /repos/<owner>/<repo>/releases/latest` (or `/releases` filtered for
-  the prerelease channel per `[updates].channel`), semver-compare `tag_name` to
-  `version::VERSION`. `version::is_release()` must be true or the updater only
-  *shows* the latest, never installs. Unauthenticated GitHub API is 60 req/hr/IP
-  - a 24 h check is nowhere near that; back off on `403`.
-- Apply: download the archive for this OS/arch **and its `.minisig`**, verify the
-  signature against the baked-in public key (`minisign-verify`), check the
-  `.sha256`, unpack, then self-replace. Windows can't overwrite a running exe:
-  rename self → drop new exe → spawn new → exit. `self-replace` handles the
-  swap; `self_update` can do the GH Releases plumbing but rolls its own verify -
-  we verify ourselves before handing it the file.
-- Coordinate with the single-instance socket lock: the new process must wait for
-  the old one to drop it. Sequence the handoff in `ipc`.
-- UI: `[updates].on_update` decides notify / auto-download / auto-install. The
-  Config button walks **Check → Downloading → Install `vX.Y.Z` (restart)**.
+- Source: GitHub Releases for `version::REPO` (public, unauthenticated).
+- `check(allow_prerelease)` - `GET /repos/<owner>/<repo>/releases?per_page=30`,
+  drop drafts (and pre-releases unless `[updates].channel = prerelease`),
+  semver-compare each `tag_name` (minus `v`) to `version::VERSION`, keep the
+  highest that's strictly newer **and** ships an asset matching
+  `version::TARGET` (the exact triple, emitted by `build.rs`) plus its
+  `.minisig`. Returns `Option<Available>`. A `development` build can still call
+  this to *see* the latest; `apply` refuses.
+- `apply(&Available)` - refuse unless `version::is_release()` **and**
+  `install::running_installed()`. Download archive + `.minisig`, verify the
+  signature against the baked-in `assets/minisign.pub` (`minisign-verify`,
+  `allow_legacy = true` so either prehashed or legacy rsign2 sigs pass), check
+  the `.sha256` if present, unpack the binary (`zip` on Windows, `tar`+`flate2`
+  on Unix), stage it next to the installed exe (same volume), then
+  `self_replace::self_replace` (rename running exe aside, move new into place),
+  then spawn `<installed exe> --relaunched-after-update` and return `Ok`.
+- Handoff: `App` on `Ok` drops the sync engine, sets `quitting`, and closes the
+  window; the spawned process runs `ipc::acquire_wait(8s)`, retrying the
+  single-instance bind until the old process has released it.
+- UI: `App::updater` (`Idle` / `Checking` / `Checked(Option<Available>)` /
+  `Installing` / `Restarting` / `Error`), advanced by `App::drain_updater` each
+  frame off two worker-thread channels, rendered by Config › Updates.
 
-**New deps when this lands**: `minisign-verify`, `self-replace` (and maybe
-`self_update`), a small `tar` + `zip` / `flate2` unpack, `semver`.
+**New deps**: `self-replace`, `minisign-verify`, `semver`;
+`zip` (`cfg(windows)`), `tar` + `flate2` (`cfg(unix)`); `winreg` (`cfg(windows)`,
+for `install.rs`).
 
 ## Logging & observability
 
@@ -1098,9 +1144,16 @@ None blocking. In rough build order:
    with minisign, and publish a GitHub Release. See Build & CI.
 5. Multilingual game titles - **DONE**. Server-resolved names, `jp` CJK font
    bundled, license in place, unused CJK otfs removed.
-6. OS autostart registration; `[sync].upload_trigger` / `pause_on_metered`
-   behaviour.
-7. Launcher / process-watch model for "pull right before you play".
-8. Auto-updater client - last. Signing (minisign) is set up in `release.yml`;
-   the user generates the keypair and sets `MINISIGN_SECRET_KEY` before the
-   first tag. See Updater.
+6. **Self-install + OS autostart** - **DONE** (`src/install.rs`). Install /
+   uninstall from Config › Startup and `coincell --uninstall`; HKCU Run /
+   `~/.config/autostart` wired to the launch-on-login toggle. Left: a Windows
+   Start Menu shortcut with an AppUserModelID (belongs with notifications) and a
+   first-run install prompt.
+7. **Self-updater** - **STARTED** (`src/update.rs`). Manual "Check for updates"
+   in Config → verify (minisign + sha256) → `self-replace` → relaunch with the
+   `ipc::acquire_wait` handoff. Left: automatic checks on `check_interval`, the
+   `on_update` download / install actions.
+8. `[sync].upload_trigger` = `on-emulator-exit` / `pause_on_metered` behaviour.
+9. Launcher / process-watch model for "pull right before you play".
+10. Notification delivery backend (OS toast sink) - `notice.rs` is wired,
+    delivery is log-only. Cross-platform, deferred.

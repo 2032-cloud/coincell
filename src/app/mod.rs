@@ -19,6 +19,43 @@ use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
 use crate::sync::{EngineEvent, RestoreSource, SyncEngine};
 use crate::theme::{self, Scheme};
+use crate::update::{self, Available};
+
+/// Self-update UI state, driven from Config › Updates.
+pub(crate) enum Updater {
+    Idle,
+    Checking(Receiver<Result<Option<Available>, String>>),
+    /// Check finished: `Some` = a newer release, `None` = up to date.
+    Checked(Option<Available>),
+    Installing(Receiver<Result<(), String>>),
+    /// Swap done; the window is closing and the new process is relaunching.
+    Restarting,
+    Error(String),
+}
+
+impl Updater {
+    /// One-line status for the Config panel.
+    pub(crate) fn status(&self) -> String {
+        match self {
+            Updater::Idle => format!("Version {}, not checked this session.", crate::version::VERSION),
+            Updater::Checking(_) => "Checking for updates…".into(),
+            Updater::Checked(av) => update::describe(av),
+            Updater::Installing(_) => "Downloading and installing…".into(),
+            Updater::Restarting => "Restarting…".into(),
+            Updater::Error(e) => format!("Update check failed: {e}"),
+        }
+    }
+    /// The release to offer an install for, if any.
+    pub(crate) fn offer(&self) -> Option<&Available> {
+        match self {
+            Updater::Checked(Some(av)) => Some(av),
+            _ => None,
+        }
+    }
+    pub(crate) fn busy(&self) -> bool {
+        matches!(self, Updater::Checking(_) | Updater::Installing(_) | Updater::Restarting)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowState {
@@ -106,6 +143,7 @@ pub struct App {
     visible_settling: u8,
     config_app: ConfigApp,
     home_app: HomeApp,
+    updater: Updater,
 }
 
 impl App {
@@ -147,6 +185,7 @@ impl App {
             visible_settling: 0,
             config_app: ConfigApp::new(),
             home_app: HomeApp::new(),
+            updater: Updater::Idle,
         }
     }
 
@@ -247,6 +286,71 @@ impl App {
         self.pending_pick = None;
         self.focus_latch = true;
         self.home_app.deliver_save_pick(&instance_id, result);
+    }
+
+    /// Kick off a GitHub Releases check on a worker thread.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if self.updater.busy() {
+            return;
+        }
+        let allow_prerelease = Config::get(|c| c.updates.channel) == crate::config::UpdateChannel::Prerelease;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(update::check(allow_prerelease).map_err(|e| format!("{e:#}")));
+                ctx.request_repaint();
+            })
+            .expect("spawn update-check thread");
+        self.updater = Updater::Checking(rx);
+    }
+
+    /// Download + verify + swap the pending update on a worker thread.
+    fn start_update_install(&mut self, ctx: &egui::Context) {
+        let Updater::Checked(Some(av)) = std::mem::replace(&mut self.updater, Updater::Idle) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("update-apply".into())
+            .spawn(move || {
+                let _ = tx.send(update::apply(&av).map_err(|e| format!("{e:#}")));
+                ctx.request_repaint();
+            })
+            .expect("spawn update-apply thread");
+        self.updater = Updater::Installing(rx);
+    }
+
+    /// Advance the updater state machine; on a finished install, shut down so the
+    /// relaunched process can take over.
+    fn drain_updater(&mut self, ctx: &egui::Context) {
+        let next = match &self.updater {
+            Updater::Checking(rx) => match rx.try_recv() {
+                Ok(Ok(av)) => Some(Updater::Checked(av)),
+                Ok(Err(e)) => Some(Updater::Error(e)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Updater::Error("the check thread stopped unexpectedly".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            Updater::Installing(rx) => match rx.try_recv() {
+                Ok(Ok(())) => Some(Updater::Restarting),
+                Ok(Err(e)) => Some(Updater::Error(e)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Updater::Error("the update thread stopped unexpectedly".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            _ => None,
+        };
+        if let Some(state) = next {
+            let restarting = matches!(state, Updater::Restarting);
+            self.updater = state;
+            if restarting {
+                tracing::info!("update applied; closing so the new build can relaunch");
+                self.sync = None;
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     /// Reset the sub-screen to its default whenever the visible window changes,
@@ -583,6 +687,7 @@ impl eframe::App for App {
         self.drain_sync(ctx);
         notice::pump();
         self.drain_pending_pick();
+        self.drain_updater(ctx);
         self.sync_shown_screen();
         self.reconcile_visibility(ctx);
 
@@ -631,7 +736,7 @@ impl eframe::App for App {
             }
 
             if self.state.is_config() {
-                match self.config_app.ui(ui, frame, &self.branding, &self.catalog) {
+                match self.config_app.ui(ui, frame, &self.branding, &self.catalog, &self.updater) {
                     ConfigOutcome::Stay => {}
                     ConfigOutcome::SyncNow => {
                         if let Some(engine) = &self.sync {
@@ -643,6 +748,8 @@ impl eframe::App for App {
                             engine.restore(&instance_id, RestoreSource::Backup { content_hash });
                         }
                     }
+                    ConfigOutcome::CheckForUpdate => self.start_update_check(ui.ctx()),
+                    ConfigOutcome::InstallUpdate => self.start_update_install(ui.ctx()),
                     ConfigOutcome::LogOut => self.begin_logout(ui.ctx()),
                     ConfigOutcome::Quit => {
                         self.quitting = true;

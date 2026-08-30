@@ -5,6 +5,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::api::{Branding, GameInstance};
+use crate::app::Updater;
 use crate::app::mapping::human_size;
 use crate::app::{icons, open_path};
 use crate::config::{Config, ConflictPolicy, LogLevel, PollInterval, Theme, UpdateAction, UpdateChannel, UploadTrigger};
@@ -22,6 +23,10 @@ pub enum ConfigOutcome {
     /// Restore a local pre-overwrite backup from the Backups section (only sent
     /// for an instance that's currently mapped).
     RestoreBackup { instance_id: String, content_hash: String },
+    /// "Check for updates" pressed.
+    CheckForUpdate,
+    /// "Download & install" pressed (a checked update is pending).
+    InstallUpdate,
     /// User confirmed logout: revoke + clear the session, return to sign-in.
     LogOut,
     /// User confirmed quit: shut the daemon down entirely.
@@ -104,12 +109,15 @@ pub struct ConfigApp {
     section: Section,
     drafts: Drafts,
     error: Option<String>,
+    /// Non-error status line (e.g. "Installed to …"), shown muted.
+    info: Option<String>,
     backup_confirm: Option<BackupConfirm>,
+    confirm_uninstall: bool,
 }
 
 impl ConfigApp {
     pub fn new() -> Self {
-        let mut app = Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None, backup_confirm: None };
+        let mut app = Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None, info: None, backup_confirm: None, confirm_uninstall: false };
         app.reset();
         app
     }
@@ -119,13 +127,15 @@ impl ConfigApp {
     pub fn reset(&mut self) {
         self.section = Section::DEFAULT;
         self.error = None;
+        self.info = None;
         self.backup_confirm = None;
+        self.confirm_uninstall = false;
         self.drafts.api_base = Config::get(|c| c.advanced.api_base.to_string());
     }
 
     pub fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {}
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding, catalog: &[GameInstance]) -> ConfigOutcome {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding, catalog: &[GameInstance], updater: &Updater) -> ConfigOutcome {
         let mut outcome = ConfigOutcome::Stay;
 
         egui::Panel::left("config_rail").resizable(false).exact_size(48.0).show(ui, |ui| {
@@ -160,6 +170,10 @@ impl ConfigApp {
                 ui.colored_label(ui.visuals().error_fg_color, err);
                 ui.add_space(4.0);
             }
+            if let Some(info) = self.info.clone() {
+                ui.weak(info);
+                ui.add_space(4.0);
+            }
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(4.0);
@@ -173,7 +187,11 @@ impl ConfigApp {
                     Section::Startup => self.startup(ui),
                     Section::Notifications => self.notifications(ui),
                     Section::Appearance => self.appearance(ui),
-                    Section::Updates => self.updates(ui),
+                    Section::Updates => {
+                        if let Some(o) = self.updates(ui, updater) {
+                            outcome = o;
+                        }
+                    }
                     Section::Backups => {
                         if let Some(o) = self.backups(ui, catalog) {
                             outcome = o;
@@ -200,7 +218,9 @@ impl ConfigApp {
     fn select(&mut self, section: Section) {
         self.section = section;
         self.error = None;
+        self.info = None;
         self.backup_confirm = None;
+        self.confirm_uninstall = false;
     }
 
     fn note_save(&mut self, r: anyhow::Result<()>) {
@@ -283,15 +303,25 @@ impl ConfigApp {
     }
 
     fn startup(&mut self, ui: &mut egui::Ui) {
+        self.install_controls(ui);
+        ui.add_space(12.0);
+
         let mut s = Config::get(|c| c.startup.clone());
         let mut changed = false;
-        changed |= ui.checkbox(&mut s.launch_on_login, "Launch CoinCell at login").changed();
+        if ui.checkbox(&mut s.launch_on_login, "Launch CoinCell at login").changed() {
+            changed = true;
+            if let Err(e) = crate::install::set_autostart(s.launch_on_login) {
+                self.error = Some(format!("Couldn't update autostart: {e:#}"));
+            }
+        }
         changed |= ui.checkbox(&mut s.start_hidden, "Start hidden in the tray").changed();
         if changed {
             let r = Config::update(|c| c.startup = s);
             self.note_save(r);
         }
-        ui.small("OS auto-start registration isn't wired up yet, this records the preference only.");
+        if !crate::install::is_installed() {
+            ui.small("Autostart applies once CoinCell is installed (above).");
+        }
 
         ui.add_space(10.0);
 
@@ -301,6 +331,56 @@ impl ConfigApp {
             self.note_save(r);
         }
         ui.small("The minimise button, Esc, and clicking the tray icon hide it regardless.");
+    }
+
+    /// Install / uninstall block at the top of the Startup section.
+    fn install_controls(&mut self, ui: &mut egui::Ui) {
+        let path = match crate::install::canonical_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                ui.small(format!("Can't determine an install location: {e:#}"));
+                return;
+            }
+        };
+
+        if crate::install::is_installed() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Installed:");
+                ui.monospace(path.display().to_string());
+            });
+            if !crate::install::running_installed() {
+                ui.small("You're running a loose copy; autostart and updates use the installed one.");
+            }
+            ui.add_space(4.0);
+            if self.confirm_uninstall {
+                ui.horizontal(|ui| {
+                    ui.label("Remove CoinCell from this device?");
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_uninstall = false;
+                    }
+                    if ui.button(egui::RichText::new("Uninstall").color(ui.visuals().error_fg_color)).clicked() {
+                        self.confirm_uninstall = false;
+                        match crate::install::uninstall(false) {
+                            Ok(()) => self.info = Some("Uninstalled. Your config and saves are kept; quit CoinCell to finish.".into()),
+                            Err(e) => self.error = Some(format!("Uninstall failed: {e:#}")),
+                        }
+                    }
+                });
+                ui.small("Keeps your config, database and logs. Delete those manually, or reinstall to keep using them.");
+            } else if ui.button("Uninstall…").clicked() {
+                self.confirm_uninstall = true;
+            }
+        } else {
+            ui.label("Not installed, running as a loose executable.");
+            ui.small(format!("Install copies CoinCell to {} and registers it for autostart, the launcher, and self-update.", path.display()));
+            ui.add_space(4.0);
+            if ui.button("Install CoinCell").clicked() {
+                match crate::install::install() {
+                    Ok(p) => self.info = Some(format!("Installed to {}. Used from the next launch on.", p.display())),
+                    Err(e) => self.error = Some(format!("Install failed: {e:#}")),
+                }
+            }
+        }
     }
 
     fn notifications(&mut self, ui: &mut egui::Ui) {
@@ -343,9 +423,10 @@ impl ConfigApp {
         ui.small("Applies immediately. “Follow account” uses the theme set on the website; “Follow system” tracks your OS. Colours come from the service's branding.");
     }
 
-    fn updates(&mut self, ui: &mut egui::Ui) {
+    fn updates(&mut self, ui: &mut egui::Ui, updater: &Updater) -> Option<ConfigOutcome> {
         let mut u = Config::get(|c| c.updates.clone());
         let mut changed = false;
+        let mut outcome = None;
 
         ui.horizontal(|ui| {
             ui.label("Current version");
@@ -372,8 +453,33 @@ impl ConfigApp {
             let r = Config::update(|c| c.updates = u);
             self.note_save(r);
         }
+
+        ui.add_space(10.0);
+        ui.separator();
         ui.add_space(6.0);
-        ui.small("The self-updater isn't built yet; these settings are stored for when it is.");
+
+        ui.label(updater.status());
+        if let Some(av) = updater.offer() {
+            let notes = av.short_notes(280);
+            if !notes.is_empty() {
+                ui.add_space(2.0);
+                ui.small(notes);
+            }
+        }
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!updater.busy(), egui::Button::new("Check for updates")).clicked() {
+                outcome = Some(ConfigOutcome::CheckForUpdate);
+            }
+            if updater.offer().is_some() && crate::version::is_release() && ui.button("Download & install").clicked() {
+                outcome = Some(ConfigOutcome::InstallUpdate);
+            }
+        });
+        if updater.offer().is_some() && !crate::install::running_installed() {
+            ui.small("Updates apply to the installed copy. Install CoinCell (Startup section) first.");
+        }
+        outcome
     }
 
     /// Every pre-overwrite local snapshot the engine has kept, newest first. This
