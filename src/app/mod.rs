@@ -114,6 +114,9 @@ pub struct App {
     /// Set once when a session first goes Ready and the crash-report preference
     /// has never been answered; drives the one-time first-run prompt.
     ask_crash_reports: bool,
+    /// Set on first Ready when running a loose release build that isn't
+    /// installed; drives the one-time "install CoinCell?" prompt.
+    ask_install: bool,
     wake_rx: Receiver<()>,
     auth: AuthView,
     device_config: DeviceConfig,
@@ -171,6 +174,7 @@ impl App {
             focus_latch: true,
             quitting: false,
             ask_crash_reports: false,
+            ask_install: false,
             wake_rx,
             auth,
             device_config,
@@ -378,6 +382,7 @@ impl App {
         self.auth = AuthView::LoggedOut { error };
         self.focus_latch = true;
         self.ask_crash_reports = false;
+        self.ask_install = false;
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -430,6 +435,65 @@ impl App {
             let _ = Config::update(|c| c.set_crash_reports(enabled));
             self.ask_crash_reports = false;
         }
+    }
+
+    /// One-time modal on the first sign-in from a loose release build: offer to
+    /// install into a stable location (which also enables self-update) and hand
+    /// off to the installed copy. "Not now" is remembered.
+    fn install_prompt(&mut self, ctx: &egui::Context) {
+        let dst = crate::install::canonical_exe().ok();
+        let resp = egui::Modal::new(egui::Id::new("first_run_install")).show(ctx, |ui| {
+            ui.set_max_width(280.0);
+            ui.heading("Install CoinCell?");
+            ui.add_space(6.0);
+            ui.label("You're running CoinCell from wherever you unzipped it. Installing copies it to a stable location, adds a Start Menu / launcher entry, and lets it keep itself up to date.");
+            if let Some(dst) = &dst {
+                ui.add_space(4.0);
+                ui.small(dst.display().to_string());
+            }
+            ui.add_space(12.0);
+            let mut pick = None;
+            ui.horizontal(|ui| {
+                if ui.button("Not now").clicked() {
+                    pick = Some(false);
+                }
+                if ui.button("Install").clicked() {
+                    pick = Some(true);
+                }
+            });
+            pick
+        });
+
+        let Some(install) = resp.inner.or_else(|| resp.should_close().then_some(false)) else {
+            return;
+        };
+        self.ask_install = false;
+        if install {
+            match crate::install::install() {
+                Ok(path) => return self.relaunch_from(ctx, path),
+                Err(e) => tracing::error!("first-run install failed: {e:#}"),
+            }
+        } else {
+            let _ = Config::update(|c| c.startup.skip_install_prompt = true);
+        }
+        // Didn't install (declined, or it failed): fall through to the
+        // crash-reports prompt this same session.
+        if !Config::get(|c| c.crash_reports_answered()) {
+            self.ask_crash_reports = true;
+        }
+    }
+
+    /// A self-install / update-in-place wrote the binary at `path`; spawn it
+    /// (with the post-update flag so it waits out our single-instance lock) and
+    /// close this process.
+    fn relaunch_from(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+        tracing::info!("handing off to {}", path.display());
+        self.sync = None;
+        self.quitting = true;
+        if let Err(e) = std::process::Command::new(&path).arg("--relaunched-after-update").spawn() {
+            tracing::error!("couldn't spawn {}: {e}", path.display());
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// Set desired window state. The OS window is brought in line by
@@ -549,7 +613,9 @@ impl App {
             Next::Ready => {
                 self.auth = AuthView::Ready;
                 self.focus_latch = true;
-                if !Config::get(|c| c.crash_reports_answered()) {
+                if crate::install::needs_first_run_prompt() {
+                    self.ask_install = true;
+                } else if !Config::get(|c| c.crash_reports_answered()) {
                     self.ask_crash_reports = true;
                 }
                 self.start_sync(ctx);
@@ -721,7 +787,7 @@ impl eframe::App for App {
                 !self.focus_latch
             }
         });
-        if lost_focus && !self.quitting && !self.ask_crash_reports && !modal_active && Config::get(|c| c.window.hide_on_focus_loss) {
+        if lost_focus && !self.quitting && !self.ask_crash_reports && !self.ask_install && !modal_active && Config::get(|c| c.window.hide_on_focus_loss) {
             ui.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide();
         }
@@ -731,7 +797,9 @@ impl eframe::App for App {
         self.header(ui);
 
         if matches!(self.auth, AuthView::Ready) {
-            if self.ask_crash_reports {
+            if self.ask_install {
+                self.install_prompt(ui.ctx());
+            } else if self.ask_crash_reports {
                 self.crash_reports_prompt(ui.ctx());
             }
 
@@ -750,6 +818,7 @@ impl eframe::App for App {
                     }
                     ConfigOutcome::CheckForUpdate => self.start_update_check(ui.ctx()),
                     ConfigOutcome::InstallUpdate => self.start_update_install(ui.ctx()),
+                    ConfigOutcome::RelaunchFrom(path) => self.relaunch_from(ui.ctx(), path),
                     ConfigOutcome::LogOut => self.begin_logout(ui.ctx()),
                     ConfigOutcome::Quit => {
                         self.quitting = true;

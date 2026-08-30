@@ -176,6 +176,7 @@ session_id = "..."
 [startup]
 launch_on_login = false       # OS autostart: Run key / .desktop / LaunchAgent
 start_hidden = true
+skip_install_prompt = false   # set by "Not now" on the first-run install prompt
 
 [sync]
 enabled = true                # global pause switch
@@ -881,23 +882,40 @@ swap it) and registers it per-user, no admin.
 - `canonical_exe()` - Windows `%LOCALAPPDATA%\Programs\CoinCell\coincell.exe`,
   Linux `~/.local/bin/coincell`. `running_installed()` / `is_installed()` gate
   the UI.
-- `install()` - copy self there (renaming a busy target aside first, the same
-  trick the updater uses), then `register()`: Windows writes an Add/Remove
+- `install()` - copy self there (renaming a busy target to `<exe>.old` first -
+  the same trick the updater uses; `cleanup_stale()` in `main` sweeps that
+  leftover next launch), then `register()`: Windows writes an Add/Remove
   Programs key (`HKCU\...\Uninstall\CoinCell`, `UninstallString` = `"<exe>"
-  --uninstall`) and, per `[startup].launch_on_login`, the `HKCU\...\Run` value;
-  Linux writes a menu `.desktop` under `~/.local/share/applications`, the icon
-  under `hicolor/128x128`, and (when enabled) an `~/.config/autostart` entry.
-- `uninstall(purge)` - undo all of it; `purge` also deletes config / db / logs /
-  cache. The binary goes last (`self_replace::self_delete()` schedules it on
-  Windows; plain `remove_file` on Unix). Reachable from the ARP entry
-  (`coincell --uninstall [--purge]`, dispatched in `main` before the
-  single-instance check) and a confirm button in Config › Startup.
+  --uninstall`), a **Start Menu `.lnk`** (`%APPDATA%\...\Start Menu\Programs\
+  CoinCell.lnk`, via `mslnk` - so Start-menu search finds it), and per
+  `[startup].launch_on_login` the `HKCU\...\Run` value; Linux writes a menu
+  `.desktop` under `~/.local/share/applications`, the icon under
+  `hicolor/128x128`, and (when enabled) an `~/.config/autostart` entry.
+- **Install acts as an update**: on success (first-run prompt *or* the Config
+  buttons) `App` gets `ConfigOutcome::RelaunchFrom(path)` / the modal calls
+  `relaunch_from` - spawn the installed exe with `--relaunched-after-update`,
+  drop the engine, close. Config › Startup also offers "Update the installed
+  copy from this build" when you're running a loose copy alongside an install.
+- **First-run prompt** - on the first `Ready` from a loose *release* build with
+  nothing installed and `!skip_install_prompt`, a one-time `egui::Modal`
+  ("Install CoinCell?", **Install** / **Not now**). "Not now" (or dismiss) sets
+  `[startup].skip_install_prompt`; the Config button stays. Shown before the
+  crash-reports prompt; declining chains to it.
+- `uninstall(purge)` - undo all of it (ARP key, `.lnk`, Run value, Linux
+  `.desktop`s + icon); `purge` also deletes config / db / logs / cache. The
+  binary goes last (`self_replace::self_delete()` schedules it on Windows;
+  `remove_file` on Unix). Reachable from the ARP entry (`coincell --uninstall
+  [--purge]`, dispatched in `main` before the single-instance check) and a
+  confirm button in Config › Startup.
 - `set_autostart(bool)` - the standalone toggle the launch-on-login checkbox
   calls.
-- **Deferred to the notification work**: a Windows Start Menu shortcut carrying
-  an AppUserModelID (needed for toasts to render as "CoinCell" and relaunch from
-  an actioned toast). `register()` has a TODO marker where it goes. A first-run
-  "install me?" prompt is also still TODO - for now you install from Config.
+- **Windows `.exe` icon**: `build.rs` embeds `assets/coincell.ico` (generated
+  from `icon_128_128.png`) via `winresource` when `CARGO_CFG_TARGET_OS ==
+  windows`, so Explorer / taskbar / Alt-Tab / the `.lnk` show the real icon.
+  The running window's icon is set separately via `ViewportBuilder::with_icon`.
+- **Still deferred to the notification work**: an AppUserModelID *on* that
+  Start Menu shortcut (needs COM / `IPropertyStore`) so Windows toasts render
+  as "CoinCell". `register()` has a TODO marker.
 
 ## Updater
 

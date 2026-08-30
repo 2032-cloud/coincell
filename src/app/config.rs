@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,9 @@ pub enum ConfigOutcome {
     CheckForUpdate,
     /// "Download & install" pressed (a checked update is pending).
     InstallUpdate,
+    /// A self-install / update-in-place just wrote the binary here; `App` should
+    /// spawn it and close.
+    RelaunchFrom(PathBuf),
     /// User confirmed logout: revoke + clear the session, return to sign-in.
     LogOut,
     /// User confirmed quit: shut the daemon down entirely.
@@ -184,7 +188,11 @@ impl ConfigApp {
                             outcome = ConfigOutcome::SyncNow;
                         }
                     }
-                    Section::Startup => self.startup(ui),
+                    Section::Startup => {
+                        if let Some(o) = self.startup(ui) {
+                            outcome = o;
+                        }
+                    }
                     Section::Notifications => self.notifications(ui),
                     Section::Appearance => self.appearance(ui),
                     Section::Updates => {
@@ -302,8 +310,8 @@ impl ConfigApp {
         sync_now
     }
 
-    fn startup(&mut self, ui: &mut egui::Ui) {
-        self.install_controls(ui);
+    fn startup(&mut self, ui: &mut egui::Ui) -> Option<ConfigOutcome> {
+        let outcome = self.install_controls(ui);
         ui.add_space(12.0);
 
         let mut s = Config::get(|c| c.startup.clone());
@@ -331,17 +339,22 @@ impl ConfigApp {
             self.note_save(r);
         }
         ui.small("The minimise button, Esc, and clicking the tray icon hide it regardless.");
+
+        outcome
     }
 
-    /// Install / uninstall block at the top of the Startup section.
-    fn install_controls(&mut self, ui: &mut egui::Ui) {
+    /// Install / uninstall block at the top of the Startup section. A successful
+    /// install or update returns `RelaunchFrom` so `App` hands off to the
+    /// installed binary.
+    fn install_controls(&mut self, ui: &mut egui::Ui) -> Option<ConfigOutcome> {
         let path = match crate::install::canonical_exe() {
             Ok(p) => p,
             Err(e) => {
                 ui.small(format!("Can't determine an install location: {e:#}"));
-                return;
+                return None;
             }
         };
+        let mut outcome = None;
 
         if crate::install::is_installed() {
             ui.horizontal_wrapped(|ui| {
@@ -350,6 +363,13 @@ impl ConfigApp {
             });
             if !crate::install::running_installed() {
                 ui.small("You're running a loose copy; autostart and updates use the installed one.");
+                ui.add_space(4.0);
+                if ui.button("Update the installed copy from this build").clicked() {
+                    match crate::install::install() {
+                        Ok(p) => outcome = Some(ConfigOutcome::RelaunchFrom(p)),
+                        Err(e) => self.error = Some(format!("Update failed: {e:#}")),
+                    }
+                }
             }
             ui.add_space(4.0);
             if self.confirm_uninstall {
@@ -376,11 +396,12 @@ impl ConfigApp {
             ui.add_space(4.0);
             if ui.button("Install CoinCell").clicked() {
                 match crate::install::install() {
-                    Ok(p) => self.info = Some(format!("Installed to {}. Used from the next launch on.", p.display())),
+                    Ok(p) => outcome = Some(ConfigOutcome::RelaunchFrom(p)),
                     Err(e) => self.error = Some(format!("Install failed: {e:#}")),
                 }
             }
         }
+        outcome
     }
 
     fn notifications(&mut self, ui: &mut egui::Ui) {

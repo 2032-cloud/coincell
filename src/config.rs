@@ -167,11 +167,14 @@ pub struct Startup {
     pub launch_on_login: bool,
     /// Start with the windows hidden to the tray.
     pub start_hidden: bool,
+    /// The user answered "Not now" to the first-run install prompt; don't offer
+    /// it again (they can still install from Config › Startup).
+    pub skip_install_prompt: bool,
 }
 
 impl Default for Startup {
     fn default() -> Self {
-        Self { launch_on_login: false, start_hidden: true }
+        Self { launch_on_login: false, start_hidden: true, skip_install_prompt: false }
     }
 }
 

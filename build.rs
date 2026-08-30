@@ -28,6 +28,29 @@ fn main() {
     println!("cargo:rustc-env=COINCELL_CHANNEL={channel}");
     println!("cargo:rustc-env=COINCELL_COMMIT={commit}");
     println!("cargo:rustc-env=COINCELL_TARGET={}", std::env::var("TARGET").unwrap_or_else(|_| "unknown".into()));
+
+    embed_windows_icon();
+}
+
+/// Bake `assets/coincell.ico` into the Windows executable so Explorer, the
+/// taskbar, Alt-Tab and the Start Menu shortcut show the real icon. No-op for
+/// non-Windows targets and when the `.ico` is absent (a source tarball).
+fn embed_windows_icon() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=assets/coincell.ico");
+    if !std::path::Path::new("assets/coincell.ico").exists() {
+        println!("cargo:warning=assets/coincell.ico missing; the .exe will use the default icon");
+        return;
+    }
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/coincell.ico");
+    res.set("ProductName", "CoinCell");
+    res.set("FileDescription", "CoinCell save sync");
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=embedding the Windows icon failed: {e}");
+    }
 }
 
 /// Run `git` with `args`; `None` if git is missing, not a repo, or the command

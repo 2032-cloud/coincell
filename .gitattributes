@@ -1,2 +1,4 @@
 assets/*.otf binary
 assets/*.ttf binary
+assets/*.ico binary
+assets/*.pub -text

@@ -17,7 +17,7 @@ pub const ASPECT_RATIO: f32 = 16.0 / 9.0; // Aspect ratio of gui, gui is always 
 pub const SCREEN_MARGIN: f32 = 10.0; // Pixel buffer from edge of display
 
 // TRAY CONSTANTS
-pub const ICON_BYTES: &[u8] = include_bytes!("../icon_128_128.png"); // Raw bytes of base logo embedded into executables
+pub const ICON_BYTES: &[u8] = include_bytes!("../assets/icon_128_128.png"); // Raw bytes of base logo embedded into executables
 
 lazy_static! {
     pub static ref PROJECT_DIRS: ProjectDirs = directories::ProjectDirs::from("com", COMPANY_NAME, APP_NAME).expect("Unable to calculate project dirs");

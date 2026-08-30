@@ -39,6 +39,10 @@ semver = "1"
 [target.'cfg(windows)'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
 winreg = "0.55"
+mslnk = "0.1"   # write the Start Menu .lnk (so search finds CoinCell)
+
+[build-dependencies]
+winresource = "0.1"   # embed the .exe icon on Windows builds
 
 [target.'cfg(unix)'.dependencies]
 tar = "0.4"

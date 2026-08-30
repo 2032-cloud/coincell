@@ -48,6 +48,27 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// `<exe>.old` — where [`place_binary`] parks a running install it's replacing.
+fn aside_path(dst: &Path) -> PathBuf {
+    let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or(BIN_STEM);
+    dst.with_file_name(format!("{name}.old"))
+}
+
+/// Best-effort removal of a leftover `<exe>.old` from an install-over-running or
+/// a self-update. Called once at startup; if it's still locked (the old process
+/// hasn't fully exited) it's retried next launch.
+pub fn cleanup_stale() {
+    if let Ok(exe) = canonical_exe() {
+        let _ = std::fs::remove_file(aside_path(&exe));
+    }
+}
+
+/// Whether to offer the one-time first-run install prompt: a loose release
+/// build, nothing installed, and the user hasn't said "not now".
+pub fn needs_first_run_prompt() -> bool {
+    crate::version::is_release() && !running_installed() && !is_installed() && !crate::config::Config::get(|c| c.startup.skip_install_prompt)
+}
+
 /// Copy this executable to [`canonical_exe`], write the OS registrations, and
 /// return the installed path. Idempotent: re-running over an existing install
 /// just refreshes both.
@@ -81,7 +102,7 @@ fn place_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
     match std::fs::copy(src, dst) {
         Ok(_) => Ok(()),
         Err(_) if dst.exists() => {
-            let aside = dst.with_extension("old");
+            let aside = aside_path(dst);
             let _ = std::fs::remove_file(&aside);
             std::fs::rename(dst, &aside)?;
             std::fs::copy(src, dst)?;
@@ -175,16 +196,32 @@ mod imp {
         arp.set_value("NoModify", &1u32)?;
         arp.set_value("NoRepair", &1u32)?;
 
-        // TODO(notifications): also drop a Start Menu shortcut carrying an
-        // AppUserModelID so Windows toasts render as "CoinCell" and can relaunch
-        // the app from an actioned toast. Needs COM (IShellLink + IPropertyStore)
-        // or a registered HKCU\Software\Classes\AppUserModelId entry.
+        // Start Menu shortcut, so typing "CoinCell" in the Start menu finds it.
+        // TODO(notifications): give this shortcut an AppUserModelID (needs COM /
+        // IPropertyStore) so Windows toasts render as "CoinCell".
+        let lnk = start_menu_lnk()?;
+        if let Some(dir) = lnk.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut sl = mslnk::ShellLink::new(&exe).map_err(|e| anyhow::anyhow!("build shortcut: {e}"))?;
+        sl.set_name(Some(APP_NAME.to_owned()));
+        sl.set_working_dir(Some(dir_s.clone()));
+        sl.set_icon_location(Some(exe_s.clone()));
+        sl.create_lnk(&lnk).map_err(|e| anyhow::anyhow!("write {}: {e}", lnk.display()))?;
         Ok(())
+    }
+
+    fn start_menu_lnk() -> Result<PathBuf> {
+        let base = directories::BaseDirs::new().context("no home directory")?;
+        Ok(base.config_dir().join(r"Microsoft\Windows\Start Menu\Programs").join(format!("{APP_NAME}.lnk")))
     }
 
     pub(super) fn unregister() {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let _ = hkcu.delete_subkey_all(arp_key());
+        if let Ok(lnk) = start_menu_lnk() {
+            let _ = std::fs::remove_file(lnk);
+        }
     }
 
     pub(super) fn set_autostart(enabled: bool) -> Result<()> {

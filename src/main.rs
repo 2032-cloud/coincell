@@ -53,6 +53,8 @@ fn main() -> anyhow::Result<()> {
     config::Config::init();
     let _log_guards = logging::init();
     tracing::info!("{} {} ({}) starting", constants::APP_NAME, version::VERSION, version::CHANNEL);
+    // Sweep a leftover `<exe>.old` from a previous install-over-running / update.
+    install::cleanup_stale();
     store::Store::init();
     // Stamp every device-API request with our version.
     api::set_user_agent(USER_AGENT.as_str());
