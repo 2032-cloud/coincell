@@ -51,6 +51,42 @@ pub fn now_epoch() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// A coarse "5 minutes ago" / "7 months ago" rendering of a server timestamp,
+/// relative to now. Falls back to the raw string if it won't parse. A timestamp
+/// in the future (clock skew) reads as "just now".
+pub fn humanize_since(ts: &str) -> String {
+    let Some(then) = parse_utc(ts) else { return ts.to_owned() };
+    humanize_delta(now_epoch() - then)
+}
+
+/// Bucket a seconds delta into a human phrase. Pulled out for testing. Unit
+/// crossovers follow the usual "45 minutes rounds up to an hour" convention; a
+/// month is treated as 30 days, a year as 365.
+fn humanize_delta(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 45 {
+        return "just now".to_owned();
+    }
+    if s < 45 * 60 {
+        return plural((s + 30) / 60, "minute");
+    }
+    if s < 22 * 3600 {
+        return plural((s + 1800) / 3600, "hour");
+    }
+    if s < 26 * 86_400 {
+        return plural((s + 43_200) / 86_400, "day");
+    }
+    if s < 11 * 2_592_000 {
+        return plural((s + 1_296_000) / 2_592_000, "month");
+    }
+    plural((s + 15_768_000) / 31_536_000, "year")
+}
+
+fn plural(n: i64, unit: &str) -> String {
+    let n = n.max(1);
+    if n == 1 { format!("1 {unit} ago") } else { format!("{n} {unit}s ago") }
+}
+
 /// `"YYYY-MM-DD HH:MM:SS"` for right now, UTC. Best-effort stand-in for a
 /// server timestamp we don't have yet (e.g. straight after an upload).
 pub fn now_utc_string() -> String {
@@ -73,6 +109,30 @@ mod tests {
         assert_eq!(mar01 - feb29, 86_400);
         // `T` + `Z` tolerated
         assert_eq!(parse_utc("2026-08-28T12:00:00Z"), parse_utc("2026-08-28 12:00:00"));
+    }
+
+    #[test]
+    fn humanize_buckets() {
+        assert_eq!(humanize_delta(0), "just now");
+        assert_eq!(humanize_delta(40), "just now");
+        assert_eq!(humanize_delta(60), "1 minute ago");
+        assert_eq!(humanize_delta(90), "2 minutes ago");
+        assert_eq!(humanize_delta(5 * 60), "5 minutes ago");
+        assert_eq!(humanize_delta(60 * 60), "1 hour ago");
+        assert_eq!(humanize_delta(3 * 3600), "3 hours ago");
+        assert_eq!(humanize_delta(26 * 3600), "1 day ago");
+        assert_eq!(humanize_delta(3 * 86_400), "3 days ago");
+        assert_eq!(humanize_delta(40 * 86_400), "1 month ago");
+        assert_eq!(humanize_delta(210 * 86_400), "7 months ago");
+        assert_eq!(humanize_delta(400 * 86_400), "1 year ago");
+        assert_eq!(humanize_delta(800 * 86_400), "2 years ago");
+        // future timestamps (clock skew) clamp to "just now"
+        assert_eq!(humanize_delta(-500), "just now");
+    }
+
+    #[test]
+    fn humanize_since_falls_back_on_junk() {
+        assert_eq!(humanize_since("not a date"), "not a date");
     }
 
     #[test]

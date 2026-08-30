@@ -405,6 +405,17 @@ impl Store {
         stmt.query_map(params![id], map_backup)?.collect()
     }
 
+    /// Drop one backup index row. Returns its `content_hash` **iff** no other row
+    /// still references that blob, so the caller can delete the file; `None` when
+    /// the blob is shared (content-addressed) or the row was already gone.
+    pub fn delete_backup(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        let hash: Option<String> = self.conn.query_row("SELECT content_hash FROM save_backups WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        let Some(hash) = hash else { return Ok(None) };
+        self.conn.execute("DELETE FROM save_backups WHERE id = ?1", params![id])?;
+        let others: i64 = self.conn.query_row("SELECT COUNT(*) FROM save_backups WHERE content_hash = ?1", params![hash], |r| r.get(0))?;
+        Ok((others == 0).then_some(hash))
+    }
+
     // ---- stream cursor ------------------------------------------------
 
     /// The persisted `?since=` cursor (max `last_saved_at` seen), or `None` for a
@@ -756,6 +767,30 @@ mod tests {
         store.unbind_instance("i").unwrap();
         assert!(store.instance("i").unwrap().is_none());
         assert_eq!(store.backups_for("i").unwrap().len(), 2, "backups survive an unmap");
+    }
+
+    #[test]
+    fn delete_backup_reports_an_orphaned_blob_but_not_a_shared_one() {
+        let store = mem();
+        store.bind_instance("i", Path::new("/saves/g.srm"), None).unwrap();
+        // two rows over the same content-addressed blob, one row over a unique blob
+        store.insert_backup("i", Path::new("/saves/g.srm"), "shared", 8, "s1", None, "pull").unwrap();
+        store.insert_backup("i", Path::new("/saves/g.srm"), "shared", 8, "s2", None, "conflict").unwrap();
+        store.insert_backup("i", Path::new("/saves/g.srm"), "lonely", 8, "s3", None, "pull").unwrap();
+        let ids: Vec<i64> = store.backups_for("i").unwrap().iter().map(|b| b.id).collect();
+
+        // deleting one of the two "shared" rows leaves the blob referenced
+        let shared_id = store.backups_for("i").unwrap().iter().find(|b| b.content_hash == "shared").unwrap().id;
+        assert_eq!(store.delete_backup(shared_id).unwrap(), None, "blob still referenced by the other row");
+        // deleting the last "shared" row frees the blob
+        let last_shared = store.backups_for("i").unwrap().iter().find(|b| b.content_hash == "shared").unwrap().id;
+        assert_eq!(store.delete_backup(last_shared).unwrap().as_deref(), Some("shared"));
+        // a unique blob is freed immediately
+        let lonely = store.backups_for("i").unwrap().iter().find(|b| b.content_hash == "lonely").unwrap().id;
+        assert_eq!(store.delete_backup(lonely).unwrap().as_deref(), Some("lonely"));
+        // deleting a row that's already gone is a no-op
+        assert_eq!(store.delete_backup(ids[0]).unwrap(), None);
+        assert!(store.backups_for("i").unwrap().is_empty());
     }
 
     #[test]

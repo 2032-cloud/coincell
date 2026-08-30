@@ -12,9 +12,10 @@ the `data.sqlite` store (`src/store.rs`), branding-driven theming
 (`src/theme.rs` off `GET /api/branding`), logging + crash reporting
 (`src/logging.rs`, `tracing` + `sentry`), the sync **engine** (`src/sync/` -
 both directions, the filesystem watcher, the offline upload queue, conflict
-resolution), and the **Home window** (`src/app/home.rs` - the game list, local
-search, the add-game flow, and the instance detail page). Left on Home: save
-history + restore. Not started: the tray menu, versioning, the updater.
+resolution, save-history restore), and the **Home window** (`src/app/home.rs` -
+the game list, local search, the add-game flow, the instance detail page, and the
+per-game save-history screen). Not started: the tray menu, versioning, the
+updater.
 
 ## What coincell is
 
@@ -223,7 +224,8 @@ here holds the defaults a newly-added game inherits.
 
 **BUILT** (`src/app/config.rs`). The window is tall and narrow (~9:16), so it's a
 **left icon rail** (48 px, Phosphor glyphs, section name on hover) + a working
-area, not a text sidebar. There is always exactly one section selected; `reset()`
+area, not a text sidebar. Eight rail sections. There is always exactly one
+section selected; `reset()`
 (called every time the window is shown as Config, and after a logout) returns it
 to **Account**.
 
@@ -263,7 +265,19 @@ Rail sections:
    pushes it to `ctx.set_zoom_factor` whenever it drifts from the stored value.
 6. **Updates** - current version (`CARGO_PKG_VERSION` for now), channel,
    check-automatically, on-update action. _(No "Check now" - no updater yet.)_
-7. **Advanced** - log level (both it and the crash-reports toggle note "applies
+7. **Save backups** - every pre-overwrite local snapshot the engine has kept
+   (`Store::backups()`), newest first, labelled by game (name resolved from the
+   catalog, else the raw instance id + original path for a deleted game). This is
+   the catch-all and the only place backups for an unmapped / deleted game are
+   reachable; per-game history with the server saves alongside lives on the
+   game's page in Home. Each row: size, relative age, `reason` gloss, **Open
+   folder**, **Delete** (inline confirm), and **Restore** - enabled only when the
+   instance is currently mapped (`ConfigOutcome::RestoreBackup` →
+   `SyncEngine::restore`), disabled with a hint otherwise. Delete drops the index
+   row and, if nothing else references the content-addressed blob
+   (`Store::delete_backup` returns the now-orphaned hash), its file. Rail icon is
+   `icons::RESTORE` (Phosphor clock-counter-clockwise).
+8. **Advanced** - log level (both it and the crash-reports toggle note "applies
    on restart"), crash-reports checkbox (shows "not answered yet" when the pref
    is absent), API base URL (commits on focus-loss, blank reverts),
    open-config-folder / open-data-folder / open-logs-folder / copy-diagnostics
@@ -434,14 +448,36 @@ Any List card click → `Mode::Detail(DetailState)`. Shows art + name + console,
 `open_path` moved to `app/mod.rs` (shared by Config + Detail). `HomeApp::mapped`
 (the cached set) is refreshed on any bind/unbind here.
 
+### Save history (`Mode::History`) **[BUILT]**
+
+Reached by a **Save history…** button on a *mapped* instance's detail page.
+`HistoryState` holds the `instance_id`, a `Task<Vec<SaveMeta>>` for
+`client.saves(id)` (newest first, no client sort - the server orders it), the
+instance's `Store::backups_for(id)` rows, and an inline `Confirm`. One vertical
+`ScrollArea`, two headed sections:
+
+- **On the server** - one `history_row` per `SaveMeta`: a leading star indicator
+  (`★` gold / `☆` muted - plain chars via font fallback, not a Phosphor glyph;
+  `cr.` has no star endpoint so it's display-only), `size · humanized age`
+  (`sync::humanize_since`, raw timestamp on hover), the `note` if any, and a
+  trailing **Restore** (inline "Confirm restore" / "Cancel"). The row whose hash
+  matches the catalog's `latest_save` shows "current", no button.
+- **Local backups** - one `history_row` per `SaveBackup`: the star slot instead
+  holds **Delete** (inline "Delete" / "Keep" confirm; `Store::delete_backup`
+  drops the row and, when it returns the now-orphaned content hash, the blob
+  file), size + age, a `reason` gloss, trailing **Restore**.
+
+Restore of either kind bubbles `HomeOutcome::Restore { instance_id, source }`
+(`sync::RestoreSource::{Server{save_id}, Backup{content_hash}}`) →
+`SyncEngine::restore`. When the engine emits `EngineEvent::Restored`, `App` calls
+`HomeApp::note_restored`, which acknowledges it in-screen and nulls the `saves`
+task so the list re-fetches. Row actions are collected out of the two layout
+closures through a `Cell<Option<HistAction>>` and applied after the scroll area.
+
 ### Not built yet
 
-- **Save history + restore** - on demand, `client.saves(id)`, sorted
-  client-side; restore an older / starred **server** save to disk. Would go on
-  the detail page. Needs a `Control::Restore { instance_id, save_id,
-  content_hash }` on the engine (download-on-worker, through the same overwrite
-  guard). Separately, a UI onto the `save_backups` the guard already collects
-  (list / restore a pre-overwrite local snapshot) once its shape is decided.
+- Nothing here. (Backend-side: `/api/events` instance push, and a `star` call so
+  a kept-after-conflict save can be pinned - see the TODOs below.)
 
 <!-- TODO (backend): `/api/events` only pushes `{type:"save",instanceId}`. Add a
      `{type:"instance",…}` (created / renamed / deleted) push so Home's catalog
@@ -536,11 +572,13 @@ bookkeeping through the `data.sqlite` store (BUILT, `src/store.rs`).
 worker thread owns both, drains the `SyncEvent`s and the debounced filesystem
 events, and does all the I/O. It talks to `App` over two channels: an
 `EngineEvent` mpsc out (`Hydrated { instances }` / `SaveAdvanced` for Home's
-catalog, plus `Status` / `Pulled` / `Pushed` / `PushPending` / `Conflict` /
-`Error` / `SessionExpired`), a `Control` mpsc in (`SyncNow`, which polls **and**
-force-pushes + drains the queue; `Rehydrate` for Home's refresh button; `Recheck
-{ instance_id }` after Home binds / pauses / unmaps; `ResolveConflict {
-instance_id, keep_local }` from the detail page). `App` holds `Option<SyncEngine>` in
+catalog, plus `Status` / `Pulled` / `Pushed` / `Restored` / `PushPending` /
+`Conflict` / `Error` / `SessionExpired`), a `Control` mpsc in (`SyncNow`, which
+polls **and** force-pushes + drains the queue; `Rehydrate` for Home's refresh
+button; `Recheck { instance_id }` after Home binds / pauses / unmaps;
+`ResolveConflict { instance_id, keep_local }` from the detail page;
+`Restore { instance_id, source }` from the history screen / Config › Save
+backups). `App` holds `Option<SyncEngine>` in
 place of the old `Option<SyncStream>` - started when auth goes `Ready`, dropped
 on logout / `[sync].enabled = false`. **All I/O (network + disk) is on the worker
 thread, never the UI thread.** Store access is the global `Store::get` /
@@ -560,11 +598,23 @@ len, modified }`; `write_atomic(path, &bytes)` (temp file in the same dir →
   `sync_all` → rename, same manners as `Config::save`).
 - `reconcile` **[BUILT]** - the pure decision function (below). No I/O; unit-tested.
 - `time` **[BUILT]** - `parse_utc` / `format_utc` / `now_utc_string` (Hinnant
-  civil-time, no calendar crate) for the server's `"YYYY-MM-DD HH:MM:SS"` format.
+  civil-time, no calendar crate) for the server's `"YYYY-MM-DD HH:MM:SS"` format,
+  plus `humanize_since` ("5 minutes ago", months = 30 d, years = 365 d) for the
+  history UI.
 - `engine` (`mod.rs`) **[BUILT]** - the worker: hydrate completeness pass,
   per-event handling, the filesystem watcher, both sync directions, the offline
-  upload queue, and conflict resolution (`resolve_conflict`, driven by the detail
-  page). Left: save-history restore.
+  upload queue, conflict resolution (`resolve_conflict`), and restore
+  (`restore`, `Control::Restore { instance_id, source: RestoreSource }`, both
+  driven by Home). `restore`: fetch the bytes (a server save via
+  `download_save`, or a local backup blob via `read_backup_blob`, hash-checked
+  either way) → `guard_overwrite(reason="restore")` snapshots the current file →
+  `write_atomic` → **re-upload** as the newest save (its own upload path, not
+  `push`, so `manual` trigger and the dedupe short-circuits don't apply; on
+  failure the disk write stands and the upload is queued). Re-uploading is what
+  makes a restore stick - otherwise the next `reconcile` sees `local != remote`,
+  `synced == local` and pulls the newer save straight back over it.
+  `EngineEvent::Restored { instance_id }` on success (logged; `HomeApp` also
+  refreshes its history screen).
 
 ### Reconcile decision
 
@@ -621,14 +671,17 @@ what we're about to write **and** isn't the last thing we pushed), writes the
 bytes to `BACKUP_DIR/<local_hash>` (content-addressed, `DATA_DIR/save-backups/`,
 next to `data.sqlite`) and indexes them in `save_backups`
 (`game_instance_id`, `original_path`, `content_hash`, `size`, `replaced_with`,
-`server_save_id`, `reason` = `"pull"` / `"conflict"`, `overwritten_at`). It
-returns `Deferred` if the file is locked (retry next round) and `Aborted` (with
-an `Error`) if the snapshot can't be written - the pull is skipped rather than
-lose bytes. `last_synced_hash` is **not** consulted: the map-time "use the
-server's copy" path seeds it to the local hash for bytes that were never sent.
-`save_backups` has **no FK / cascade** to `instances` - a backup outlives an
-unmap. Not built yet: any pruning (the dir grows unbounded; saves are tiny) and
-any UI or restore path.
+`server_save_id` (now `Option<&str>` - `None` for a backup-blob restore, which
+has no server save id), `reason` = `"pull"` / `"conflict"` / `"restore"`,
+`overwritten_at`). It returns `Deferred` if the file is locked (retry next round)
+and `Aborted` (with an `Error`) if the snapshot can't be written - the pull is
+skipped rather than lose bytes. `last_synced_hash` is **not** consulted: the
+map-time "use the server's copy" path seeds it to the local hash for bytes that
+were never sent. `save_backups` has **no FK / cascade** to `instances` - a backup
+outlives an unmap. Restore of a snapshot is via the history UI / Config › Save
+backups (see those); `Store::delete_backup` there prunes a row and its blob when
+nothing else references it. Still not built: automatic pruning (the dir grows
+unbounded without a manual delete; saves are tiny).
 
 ### Event handling
 
@@ -945,12 +998,13 @@ None blocking. In rough build order:
 
 1. **Sync engine** (`src/sync/`) - BUILT: both directions, the debounced
    filesystem watcher, the offline upload queue, conflict resolution,
-   `Unauthorized` handling. Left: save-history restore, and a finer pause than
+   `Unauthorized` handling, save-history restore. Left: a finer pause than
    "drop the whole engine" (`pause_on_metered` / metered-connection awareness).
 2. **Home window** (`src/app/home.rs`) - BUILT: the game list + local fuzzy
-   search + mapped/unmapped split + box art, the add-game flow, and the instance
-   detail page (map an existing save, pause, unmap, sync-now, conflict picker).
-   Left: save history + restore on the detail page.
+   search + mapped/unmapped split + box art, the add-game flow, the instance
+   detail page (map an existing save, pause, unmap, sync-now, conflict picker),
+   and the per-game save-history screen (server saves + local backups, restore /
+   delete). Nothing left.
 3. `build.rs` versioning (Updates panel shows raw `CARGO_PKG_VERSION` today) -
    also feeds Sentry `release` / `environment` and the API `User-Agent`.
 4. Multilingual game titles: names come pre-resolved from the server (per the

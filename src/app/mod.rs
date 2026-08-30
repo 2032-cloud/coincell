@@ -17,7 +17,7 @@ use crate::app::home::{HomeApp, HomeOutcome, HomeView};
 use crate::config::Config;
 use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
-use crate::sync::{EngineEvent, SyncEngine};
+use crate::sync::{EngineEvent, RestoreSource, SyncEngine};
 use crate::theme::{self, Scheme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +193,10 @@ impl App {
                     notice::post(Notice::Pulled { game: self.game_label(&instance_id) });
                 }
                 EngineEvent::Pushed { instance_id } => tracing::info!("pushed save for {instance_id}"),
+                EngineEvent::Restored { instance_id } => {
+                    tracing::info!("restored a save for {instance_id}");
+                    self.home_app.note_restored(&instance_id);
+                }
                 EngineEvent::PushPending { instance_id } => tracing::debug!("{instance_id}: local change waiting (manual upload)"),
                 EngineEvent::Conflict { instance_id } => {
                     tracing::warn!("{instance_id}: conflict, resolve in Home");
@@ -627,11 +631,16 @@ impl eframe::App for App {
             }
 
             if self.state.is_config() {
-                match self.config_app.ui(ui, frame, &self.branding) {
+                match self.config_app.ui(ui, frame, &self.branding, &self.catalog) {
                     ConfigOutcome::Stay => {}
                     ConfigOutcome::SyncNow => {
                         if let Some(engine) = &self.sync {
                             engine.sync_now();
+                        }
+                    }
+                    ConfigOutcome::RestoreBackup { instance_id, content_hash } => {
+                        if let Some(engine) = &self.sync {
+                            engine.restore(&instance_id, RestoreSource::Backup { content_hash });
                         }
                     }
                     ConfigOutcome::LogOut => self.begin_logout(ui.ctx()),
@@ -669,6 +678,11 @@ impl eframe::App for App {
                     }
                     HomeOutcome::OpenSaveDialog { instance_id, title } => {
                         self.open_save_dialog(ui.ctx(), instance_id, title);
+                    }
+                    HomeOutcome::Restore { instance_id, source } => {
+                        if let Some(engine) = &self.sync {
+                            engine.restore(&instance_id, source);
+                        }
                     }
                 }
             }

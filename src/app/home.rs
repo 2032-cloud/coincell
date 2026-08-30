@@ -22,8 +22,8 @@ use crate::api::{Branding, Client, Console, Game, GameInstance, NewGameInstance,
 use crate::app::mapping::{self, PickedSave};
 use crate::app::{icons, open_path};
 use crate::config::ConflictPolicy;
-use crate::store::{InstanceRecord, Store};
-use crate::sync::{Action, LocalFile, reconcile};
+use crate::store::{InstanceRecord, SaveBackup, Store};
+use crate::sync::{Action, LocalFile, RestoreSource, humanize_since, reconcile};
 use crate::theme::homepage_path;
 
 /// Borrowed context `App` hands to Home each frame.
@@ -61,6 +61,11 @@ pub enum HomeOutcome {
         instance_id: String,
         title: String,
     },
+    /// Put an older save (server history or a local backup) back on disk.
+    Restore {
+        instance_id: String,
+        source: RestoreSource,
+    },
 }
 
 enum Mode {
@@ -70,6 +75,7 @@ enum Mode {
     Compose { console: Console, game: Option<Game>, game_name: String, session_name: String },
     MapPrompt(MapPrompt),
     Detail(DetailState),
+    History(HistoryState),
 }
 
 /// The "choose an existing save file, size-check, decide local vs server, bind"
@@ -98,6 +104,48 @@ struct DetailState {
     console_sizes: Vec<u64>,
     pick: FilePick,
     confirm_unmap: bool,
+}
+
+/// The save-history screen: the instance's server saves plus its local
+/// pre-overwrite backups, each restorable, backups also deletable.
+struct HistoryState {
+    instance_id: String,
+    /// Carried through so returning to `Detail` is free.
+    console_sizes: Vec<u64>,
+    /// Server save list; `None` triggers a (re)fetch on the next frame.
+    saves: Option<Task<Vec<SaveMeta>>>,
+    /// Local snapshots for this instance, re-read after a delete.
+    backups: Vec<SaveBackup>,
+    /// A pending inline confirm (restore or delete).
+    confirm: Option<Confirm>,
+    /// Set by [`HomeApp::note_restored`] once the engine reports the restore
+    /// landed, for a one-line acknowledgement.
+    restored: bool,
+}
+
+impl HistoryState {
+    fn new(instance_id: String, console_sizes: Vec<u64>) -> Self {
+        let backups = Store::get(|s| s.backups_for(&instance_id)).unwrap_or_default();
+        Self { instance_id, console_sizes, saves: None, backups, confirm: None, restored: false }
+    }
+}
+
+enum Confirm {
+    RestoreServer(String), // save id
+    RestoreBackup(String), // content hash
+    DeleteBackup(i64),     // backup row id
+}
+
+/// A row action collected out of the history list's closures (via a `Cell`, so
+/// the lead and trailing closures can both write) and applied after layout.
+enum HistAction {
+    CancelConfirm,
+    AskRestoreServer(String),
+    AskRestoreBackup(String),
+    AskDeleteBackup(i64),
+    RestoreServer(String),
+    RestoreBackup(String),
+    DeleteBackup { id: i64, hash: String },
 }
 
 pub struct HomeApp {
@@ -176,6 +224,7 @@ impl HomeApp {
                 Mode::Compose { console, game, game_name, session_name } => self.compose_view(ui, &view, console, game, game_name, session_name),
                 Mode::MapPrompt(prompt) => self.map_prompt_view(ui, &view, &mut outcome, prompt),
                 Mode::Detail(state) => self.detail_view(ui, &view, &mut outcome, state),
+                Mode::History(state) => self.history_view(ui, &view, &mut outcome, state),
             };
         });
 
@@ -618,6 +667,11 @@ impl HomeApp {
                     }
                 });
                 ui.small("Unmapping keeps the game on your account and the file on disk; it just stops syncing here.");
+
+                ui.add_space(8.0);
+                if ui.button("Save history…").clicked() {
+                    return Mode::History(HistoryState::new(state.instance_id.clone(), state.console_sizes.clone()));
+                }
             }
         }
 
@@ -627,6 +681,205 @@ impl HomeApp {
         ui.hyperlink_to(format!("Rename, star or add notes on {} ↗", view.branding.identity.name), homepage_path(view.branding, "games"));
 
         Mode::Detail(state)
+    }
+
+    // ---- save history ---------------------------------------------
+
+    fn history_view(&mut self, ui: &mut egui::Ui, view: &HomeView<'_>, outcome: &mut HomeOutcome, mut state: HistoryState) -> Mode {
+        let title = view.catalog.iter().find(|g| g.id == state.instance_id).map(display_title).unwrap_or("this game").to_owned();
+
+        let mut back = false;
+        ui.horizontal(|ui| {
+            if ui.button("Back").clicked() {
+                back = true;
+            }
+            ui.label(egui::RichText::new("Save history").strong());
+            ui.weak(format!("· {title}"));
+        });
+        if back {
+            return Mode::Detail(DetailState { instance_id: state.instance_id, console_sizes: state.console_sizes, pick: FilePick::default(), confirm_unmap: false });
+        }
+        ui.separator();
+        ui.add_space(6.0);
+
+        if let Some(err) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, err);
+            ui.add_space(6.0);
+        }
+        if state.restored {
+            ui.colored_label(OK_GREEN, "Restored. Your previous save is kept as a local backup below.");
+            ui.add_space(6.0);
+        }
+
+        // (Re)fetch the server list lazily: on entry, and after a restore lands.
+        if state.saves.is_none() {
+            state.saves = Some(Task::spawn(ui.ctx().clone(), {
+                let (client, id) = (view.client.clone(), state.instance_id.clone());
+                move || client.saves(&id).map_err(|e| e.to_string())
+            }));
+        }
+
+        let current_hash: Option<String> = view.catalog.iter().find(|g| g.id == state.instance_id).and_then(|g| g.latest_save.as_ref()).map(|s| s.content_hash.clone());
+
+        let action: std::cell::Cell<Option<HistAction>> = std::cell::Cell::new(None);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(egui::RichText::new("On the server").strong().size(12.0));
+            ui.add_space(2.0);
+            match state.saves.as_mut().map(Task::state) {
+                None | Some(TaskState::Running) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Loading…");
+                    });
+                }
+                Some(TaskState::Failed(e)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, "Couldn't load the server's saves.");
+                    ui.small(e);
+                }
+                Some(TaskState::Done(saves)) if saves.is_empty() => {
+                    ui.weak("No saves on the server yet.");
+                }
+                Some(TaskState::Done(saves)) => {
+                    for save in saves {
+                        let is_current = current_hash.as_deref() == Some(save.content_hash.as_str());
+                        let confirming = matches!(&state.confirm, Some(Confirm::RestoreServer(id)) if id == &save.id);
+                        history_row(
+                            ui,
+                            save.size_bytes,
+                            save.uploaded_at.as_str(),
+                            |ui| {
+                                let (glyph, color, hover) = if save.starred {
+                                    ("\u{2605}", GOLD, "Starred \u{2014} kept regardless of the retention limit")
+                                } else {
+                                    ("\u{2606}", ui.visuals().weak_text_color(), "Not starred")
+                                };
+                                ui.label(egui::RichText::new(glyph).size(15.0).color(color)).on_hover_text(hover);
+                            },
+                            |ui| {
+                                if is_current {
+                                    ui.weak("current");
+                                } else if confirming {
+                                    if ui.button("Confirm restore").clicked() {
+                                        action.set(Some(HistAction::RestoreServer(save.id.clone())));
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        action.set(Some(HistAction::CancelConfirm));
+                                    }
+                                } else if ui.button("Restore").clicked() {
+                                    action.set(Some(HistAction::AskRestoreServer(save.id.clone())));
+                                }
+                            },
+                        );
+                        if confirming {
+                            ui.small("Writes this save to disk and re-uploads it as the newest. Your current save is backed up first.");
+                        }
+                        if let Some(note) = save.note.as_deref().filter(|n| !n.is_empty()) {
+                            ui.small(egui::RichText::new(note).weak());
+                        }
+                    }
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Local backups").strong().size(12.0));
+            ui.small("Snapshots taken before a sync would have overwritten unsaved local changes.");
+            ui.add_space(4.0);
+            if state.backups.is_empty() {
+                ui.weak("None.");
+            } else {
+                for b in &state.backups {
+                    let deleting = matches!(&state.confirm, Some(Confirm::DeleteBackup(id)) if *id == b.id);
+                    let restoring = matches!(&state.confirm, Some(Confirm::RestoreBackup(h)) if h == &b.content_hash);
+                    history_row(
+                        ui,
+                        b.size_bytes,
+                        b.overwritten_at.as_str(),
+                        |ui| {
+                            if deleting {
+                                if ui.button(egui::RichText::new("Delete").color(ui.visuals().error_fg_color)).clicked() {
+                                    action.set(Some(HistAction::DeleteBackup { id: b.id, hash: b.content_hash.clone() }));
+                                }
+                                if ui.button("Keep").clicked() {
+                                    action.set(Some(HistAction::CancelConfirm));
+                                }
+                            } else if ui.button("Delete").on_hover_text("Delete this backup").clicked() {
+                                action.set(Some(HistAction::AskDeleteBackup(b.id)));
+                            }
+                        },
+                        |ui| {
+                            if restoring {
+                                if ui.button("Confirm restore").clicked() {
+                                    action.set(Some(HistAction::RestoreBackup(b.content_hash.clone())));
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    action.set(Some(HistAction::CancelConfirm));
+                                }
+                            } else if ui.button("Restore").clicked() {
+                                action.set(Some(HistAction::AskRestoreBackup(b.content_hash.clone())));
+                            }
+                        },
+                    );
+                    ui.small(egui::RichText::new(backup_reason(&b.reason)).weak());
+                    if restoring {
+                        ui.small("Writes this snapshot to disk and re-uploads it as the newest. Your current save is backed up first.");
+                    }
+                }
+            }
+            ui.add_space(8.0);
+        });
+
+        match action.take() {
+            None => {}
+            Some(HistAction::CancelConfirm) => state.confirm = None,
+            Some(HistAction::AskRestoreServer(id)) => {
+                state.restored = false;
+                state.confirm = Some(Confirm::RestoreServer(id));
+            }
+            Some(HistAction::AskRestoreBackup(h)) => {
+                state.restored = false;
+                state.confirm = Some(Confirm::RestoreBackup(h));
+            }
+            Some(HistAction::AskDeleteBackup(id)) => state.confirm = Some(Confirm::DeleteBackup(id)),
+            Some(HistAction::RestoreServer(save_id)) => {
+                self.error = None;
+                state.confirm = None;
+                *outcome = HomeOutcome::Restore { instance_id: state.instance_id.clone(), source: RestoreSource::Server { save_id } };
+            }
+            Some(HistAction::RestoreBackup(content_hash)) => {
+                self.error = None;
+                state.confirm = None;
+                *outcome = HomeOutcome::Restore { instance_id: state.instance_id.clone(), source: RestoreSource::Backup { content_hash } };
+            }
+            Some(HistAction::DeleteBackup { id, hash }) => {
+                state.confirm = None;
+                match Store::write(|s| s.delete_backup(id)) {
+                    Ok(orphan) => {
+                        if orphan.as_deref() == Some(hash.as_str()) {
+                            let _ = std::fs::remove_file(crate::constants::BACKUP_DIR.join(&hash));
+                        }
+                        state.backups = Store::get(|s| s.backups_for(&state.instance_id)).unwrap_or_default();
+                    }
+                    Err(e) => self.error = Some(format!("Couldn't delete the backup: {e:#}")),
+                }
+            }
+        }
+
+        Mode::History(state)
+    }
+
+    /// The engine finished a restore we asked for; acknowledge it and re-pull the
+    /// server list so the new newest-save shows. No-op unless that instance's
+    /// history is the screen.
+    pub fn note_restored(&mut self, instance_id: &str) {
+        if let Mode::History(h) = &mut self.mode
+            && h.instance_id == instance_id
+        {
+            h.restored = true;
+            h.confirm = None;
+            h.saves = None;
+            h.backups = Store::get(|s| s.backups_for(instance_id)).unwrap_or_default();
+        }
     }
 
     /// Drop add-game scratch state and re-read which instances are mapped.
@@ -806,6 +1059,37 @@ fn instance_status(book: &InstanceRecord, inst: &GameInstance) -> String {
         Action::Pull => "a newer save is on the server".to_owned(),
         Action::Push => "local changes not yet uploaded".to_owned(),
         Action::Conflict => "conflict".to_owned(),
+    }
+}
+
+/// A filled star would need Phosphor's Fill weight, which isn't bundled; the
+/// Regular outline is tinted this gold when a save is starred instead.
+const GOLD: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xB1, 0x3A);
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+
+/// One history row: a fixed-width leading slot (a star indicator for server
+/// saves, a delete control for local backups), the size and relative age, then a
+/// trailing slot (Restore, or an inline confirm). The two slots are filled by
+/// closures so both list kinds share this layout.
+fn history_row(ui: &mut egui::Ui, size: u64, when_raw: &str, lead: impl FnOnce(&mut egui::Ui), trailing: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.scope(|ui| {
+            ui.set_min_width(46.0);
+            lead(ui);
+        });
+        ui.label(format!("{} · {}", mapping::human_size(size), humanize_since(when_raw))).on_hover_text(when_raw);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
+    });
+}
+
+/// Friendly gloss for a `save_backups.reason`.
+fn backup_reason(reason: &str) -> &'static str {
+    match reason {
+        "pull" => "Kept before downloading a newer save",
+        "conflict" => "Kept before resolving a conflict",
+        "restore" => "Kept before a restore",
+        _ => "Kept before an overwrite",
     }
 }
 

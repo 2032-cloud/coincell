@@ -1,11 +1,16 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 
-use crate::api::Branding;
+use crate::api::{Branding, GameInstance};
+use crate::app::mapping::human_size;
 use crate::app::{icons, open_path};
 use crate::config::{Config, ConflictPolicy, LogLevel, PollInterval, Theme, UpdateAction, UpdateChannel, UploadTrigger};
+use crate::constants::BACKUP_DIR;
+use crate::store::Store;
+use crate::sync::humanize_since;
 use crate::theme::homepage_path;
 
 /// What the config screen wants the parent `App` to do after this frame.
@@ -14,6 +19,9 @@ pub enum ConfigOutcome {
     Stay,
     /// "Sync now" pressed, poke the sync engine.
     SyncNow,
+    /// Restore a local pre-overwrite backup from the Backups section (only sent
+    /// for an instance that's currently mapped).
+    RestoreBackup { instance_id: String, content_hash: String },
     /// User confirmed logout: revoke + clear the session, return to sign-in.
     LogOut,
     /// User confirmed quit: shut the daemon down entirely.
@@ -28,6 +36,7 @@ enum Section {
     Notifications,
     Appearance,
     Updates,
+    Backups,
     Advanced,
     // Reachable only through a footer action, never the rail. There is always
     // exactly one selected section; there is no "nothing selected" state.
@@ -37,7 +46,7 @@ enum Section {
 
 impl Section {
     const DEFAULT: Section = Section::Account;
-    const RAIL: [Section; 7] = [Section::Account, Section::Sync, Section::Startup, Section::Notifications, Section::Appearance, Section::Updates, Section::Advanced];
+    const RAIL: [Section; 8] = [Section::Account, Section::Sync, Section::Startup, Section::Notifications, Section::Appearance, Section::Updates, Section::Backups, Section::Advanced];
 
     fn title(self) -> &'static str {
         match self {
@@ -47,6 +56,7 @@ impl Section {
             Section::Notifications => "Notifications",
             Section::Appearance => "Appearance",
             Section::Updates => "Updates",
+            Section::Backups => "Save backups",
             Section::Advanced => "Advanced",
             Section::ConfirmLogout => "Log out",
             Section::ConfirmQuit => "Quit CoinCell",
@@ -61,6 +71,7 @@ impl Section {
             Section::Notifications => icons::BELL,
             Section::Appearance => icons::PALETTE,
             Section::Updates => icons::DOWNLOAD,
+            Section::Backups => icons::RESTORE,
             Section::Advanced => icons::WRENCH,
             Section::ConfirmLogout => icons::SIGN_OUT,
             Section::ConfirmQuit => icons::POWER,
@@ -73,15 +84,32 @@ struct Drafts {
     api_base: String,
 }
 
+/// A pending inline confirm in the Backups section, keyed to a `save_backups.id`.
+enum BackupConfirm {
+    Restore(i64),
+    Delete(i64),
+}
+
+/// Short gloss for a `save_backups.reason`.
+fn reason_gloss(reason: &str) -> &'static str {
+    match reason {
+        "pull" => "before a download",
+        "conflict" => "before a conflict resolve",
+        "restore" => "before a restore",
+        _ => "before an overwrite",
+    }
+}
+
 pub struct ConfigApp {
     section: Section,
     drafts: Drafts,
     error: Option<String>,
+    backup_confirm: Option<BackupConfirm>,
 }
 
 impl ConfigApp {
     pub fn new() -> Self {
-        let mut app = Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None };
+        let mut app = Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None, backup_confirm: None };
         app.reset();
         app
     }
@@ -91,12 +119,13 @@ impl ConfigApp {
     pub fn reset(&mut self) {
         self.section = Section::DEFAULT;
         self.error = None;
+        self.backup_confirm = None;
         self.drafts.api_base = Config::get(|c| c.advanced.api_base.to_string());
     }
 
     pub fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {}
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding) -> ConfigOutcome {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding, catalog: &[GameInstance]) -> ConfigOutcome {
         let mut outcome = ConfigOutcome::Stay;
 
         egui::Panel::left("config_rail").resizable(false).exact_size(48.0).show(ui, |ui| {
@@ -145,6 +174,11 @@ impl ConfigApp {
                     Section::Notifications => self.notifications(ui),
                     Section::Appearance => self.appearance(ui),
                     Section::Updates => self.updates(ui),
+                    Section::Backups => {
+                        if let Some(o) = self.backups(ui, catalog) {
+                            outcome = o;
+                        }
+                    }
                     Section::Advanced => self.advanced(ui),
                     Section::ConfirmLogout => match confirm(ui, "Log out on this device? Syncing stops until you sign in again.", "Log out") {
                         Some(true) => outcome = ConfigOutcome::LogOut,
@@ -166,6 +200,7 @@ impl ConfigApp {
     fn select(&mut self, section: Section) {
         self.section = section;
         self.error = None;
+        self.backup_confirm = None;
     }
 
     fn note_save(&mut self, r: anyhow::Result<()>) {
@@ -336,6 +371,99 @@ impl ConfigApp {
         }
         ui.add_space(6.0);
         ui.small("The self-updater isn't built yet; these settings are stored for when it is.");
+    }
+
+    /// Every pre-overwrite local snapshot the engine has kept, newest first. This
+    /// is the catch-all, and the only place backups for an unmapped or deleted
+    /// game are reachable. Per-game history (with server saves too) lives on the
+    /// game's own page in Home.
+    fn backups(&mut self, ui: &mut egui::Ui, catalog: &[GameInstance]) -> Option<ConfigOutcome> {
+        let rows = match Store::get(|s| s.backups()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                ui.colored_label(ui.visuals().error_fg_color, format!("Couldn't read the backups: {e:#}"));
+                return None;
+            }
+        };
+
+        ui.small("Snapshots the engine takes before a sync would overwrite unsaved local changes. The bytes live next to the database; restoring one writes it back to disk and re-uploads it as the newest save.");
+        ui.add_space(8.0);
+
+        if rows.is_empty() {
+            ui.weak("No local backups.");
+            return None;
+        }
+
+        let bound: HashSet<String> = Store::get(|s| s.instances()).map(|v| v.into_iter().map(|r| r.game_instance_id).collect()).unwrap_or_default();
+        let mut outcome = None;
+
+        for b in &rows {
+            let name = catalog.iter().find(|g| g.id == b.game_instance_id).map(|g| g.name.as_str());
+            let mapped = bound.contains(&b.game_instance_id);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new(name.unwrap_or(&b.game_instance_id)).strong());
+                ui.small(egui::RichText::new(b.original_path.display().to_string()).weak());
+                ui.small(format!("{} · {} · {}", human_size(b.size_bytes), humanize_since(&b.overwritten_at), reason_gloss(&b.reason)));
+                ui.add_space(4.0);
+
+                match &self.backup_confirm {
+                    Some(BackupConfirm::Delete(id)) if *id == b.id => {
+                        ui.horizontal(|ui| {
+                            ui.label("Delete this backup?");
+                            if ui.button(egui::RichText::new("Delete").color(ui.visuals().error_fg_color)).clicked() {
+                                self.delete_backup(b.id, &b.content_hash);
+                            }
+                            if ui.button("Keep").clicked() {
+                                self.backup_confirm = None;
+                            }
+                        });
+                    }
+                    Some(BackupConfirm::Restore(id)) if *id == b.id => {
+                        ui.label("Write this to disk and re-upload it as the newest save? Your current save is backed up first.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm restore").clicked() {
+                                outcome = Some(ConfigOutcome::RestoreBackup { instance_id: b.game_instance_id.clone(), content_hash: b.content_hash.clone() });
+                                self.backup_confirm = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.backup_confirm = None;
+                            }
+                        });
+                    }
+                    _ => {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(mapped, egui::Button::new("Restore")).on_disabled_hover_text("Map this game to a local save file first, on its page in Home.").clicked() {
+                                self.backup_confirm = Some(BackupConfirm::Restore(b.id));
+                            }
+                            if ui.button("Delete").clicked() {
+                                self.backup_confirm = Some(BackupConfirm::Delete(b.id));
+                            }
+                            if let Some(dir) = b.original_path.parent()
+                                && ui.button("Open folder").clicked()
+                            {
+                                open_path(dir);
+                            }
+                        });
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        outcome
+    }
+
+    /// Drop a backup index row and, if nothing else references the blob, its file.
+    fn delete_backup(&mut self, id: i64, _hash: &str) {
+        self.backup_confirm = None;
+        match Store::write(|s| s.delete_backup(id)) {
+            Ok(Some(orphan)) => {
+                let _ = std::fs::remove_file(BACKUP_DIR.join(&orphan));
+            }
+            Ok(None) => {}
+            Err(e) => self.error = Some(format!("Couldn't delete the backup: {e:#}")),
+        }
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {

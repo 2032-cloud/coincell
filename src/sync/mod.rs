@@ -15,6 +15,7 @@ mod time;
 pub use disk::{LocalFile, write_atomic};
 pub use hash::sha256_hex;
 pub use reconcile::{Action, reconcile};
+pub use time::humanize_since;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -65,6 +66,11 @@ pub enum EngineEvent {
     Pulled {
         instance_id: String,
     },
+    /// A user-chosen older save (server history or a local pre-overwrite backup)
+    /// was written to disk and re-uploaded as the newest save.
+    Restored {
+        instance_id: String,
+    },
     /// Local bytes were uploaded to the server (live or from the queue).
     Pushed {
         instance_id: String,
@@ -99,6 +105,20 @@ pub enum Control {
     /// Resolve a recorded conflict by keeping one side: upload the local file
     /// (`keep_local`) or download the server's, either way clearing the marker.
     ResolveConflict { instance_id: String, keep_local: bool },
+    /// Put an older save back on disk and re-upload it as the newest, so it
+    /// sticks (the next reconcile would otherwise pull the newer one back over
+    /// it). The current on-disk save is snapshotted first via the overwrite
+    /// guard. Ignored unless the instance is mapped to a local file.
+    Restore { instance_id: String, source: RestoreSource },
+}
+
+/// Where the bytes for a [`Control::Restore`] come from.
+pub enum RestoreSource {
+    /// A save still on the server, by its `saves` list id.
+    Server { save_id: String },
+    /// A local pre-overwrite snapshot, by the `content_hash` naming its blob in
+    /// `BACKUP_DIR`.
+    Backup { content_hash: String },
 }
 
 pub struct SyncEngine {
@@ -141,6 +161,12 @@ impl SyncEngine {
     /// Resolve a conflict on one instance: keep the local file or the server's.
     pub fn resolve_conflict(&self, instance_id: impl Into<String>, keep_local: bool) {
         let _ = self.control.send(Control::ResolveConflict { instance_id: instance_id.into(), keep_local });
+    }
+
+    /// Restore an older save (server history or a local backup) to disk and
+    /// re-upload it as the newest.
+    pub fn restore(&self, instance_id: impl Into<String>, source: RestoreSource) {
+        let _ = self.control.send(Control::Restore { instance_id: instance_id.into(), source });
     }
 }
 
@@ -223,6 +249,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
                         self.recheck_one(&instance_id);
                     }
                     Control::ResolveConflict { instance_id, keep_local } => self.resolve_conflict(&instance_id, keep_local),
+                    Control::Restore { instance_id, source } => self.restore(&instance_id, source),
                 }
                 worked = true;
             }
@@ -377,6 +404,84 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
         }
     }
 
+    /// Put an older save back on disk and make it the newest on the server.
+    ///
+    /// The bytes come from server history or a local backup blob; either way the
+    /// current on-disk save is snapshotted first (the overwrite guard), then the
+    /// restored bytes are written and re-uploaded. The re-upload is what makes
+    /// the restore stick: without a fresh newest-save row, the next reconcile
+    /// sees `local != remote`, `synced == local` and pulls the newer save back.
+    fn restore(&mut self, instance_id: &str, source: RestoreSource) {
+        let book = match Store::get(|s| s.instance(instance_id)) {
+            Ok(Some(book)) => book,
+            Ok(None) => {
+                // The UI disables restore when unmapped; this is just belt-and-braces.
+                tracing::warn!("restore {instance_id}: not mapped to a local file, ignoring");
+                return;
+            }
+            Err(e) => return self.emit(EngineEvent::Error(format!("store: {e:#}"))),
+        };
+
+        let (bytes, hash, server_save_id) = match &source {
+            RestoreSource::Server { save_id } => {
+                let bytes = match self.client.download_save(instance_id, save_id) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.is_unauthorized() => return self.emit(EngineEvent::SessionExpired),
+                    Err(e) => return self.emit(EngineEvent::Error(format!("restore download {instance_id}: {e}"))),
+                };
+                let hash = sha256_hex(&bytes);
+                (bytes, hash, Some(save_id.clone()))
+            }
+            RestoreSource::Backup { content_hash } => {
+                let bytes = match read_backup_blob(&BACKUP_DIR, content_hash) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => return self.emit(EngineEvent::Error(format!("restore {instance_id}: the backup file is missing"))),
+                    Err(e) => return self.emit(EngineEvent::Error(format!("restore read backup: {e}"))),
+                };
+                let hash = sha256_hex(&bytes);
+                if &hash != content_hash {
+                    return self.emit(EngineEvent::Error(format!("restore {instance_id}: the backup file is corrupt")));
+                }
+                (bytes, hash, None)
+            }
+        };
+
+        // Snapshot the current on-disk save before we replace it.
+        match self.guard_overwrite(&book, &hash, server_save_id.as_deref(), "restore") {
+            Guard::Proceed => {}
+            Guard::Deferred => return self.emit(EngineEvent::Error(format!("restore {instance_id}: the save file is in use, try again"))),
+            Guard::Aborted => return,
+        }
+
+        if let Err(e) = write_atomic(&book.save_path, &bytes) {
+            return self.emit(EngineEvent::Error(format!("restore write {}: {e}", book.save_path.display())));
+        }
+
+        // Re-upload so the restored bytes become the newest server save.
+        let size = bytes.len() as u64;
+        match self.client.upload_save(instance_id, bytes.clone()) {
+            Ok(outcome) => {
+                self.store_write(Store::write(|s| {
+                    s.clear_stale_uploads(instance_id, &hash)?;
+                    s.record_uploaded(instance_id, &hash)?;
+                    s.record_synced(instance_id, &hash, &outcome.id)
+                }));
+                self.remote.insert(instance_id.to_owned(), synthetic_save(&outcome.id, &hash, size));
+            }
+            Err(e) if e.is_unauthorized() => return self.emit(EngineEvent::SessionExpired),
+            Err(e) => {
+                // Disk already holds the restored bytes; queue the upload so it
+                // still becomes newest once we're back online.
+                tracing::warn!("restore upload {instance_id} failed, queued: {e}");
+                self.store_write(Store::write(|s| {
+                    s.clear_stale_uploads(instance_id, &hash)?;
+                    s.enqueue_upload(instance_id, &hash, &bytes)
+                }));
+            }
+        }
+        self.emit(EngineEvent::Restored { instance_id: instance_id.to_owned() });
+    }
+
     /// Re-reconcile every mapped, non-paused instance against its cached server
     /// state. `force` uploads even under `upload_trigger = manual`.
     fn rescan(&mut self, force: bool) {
@@ -436,7 +541,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
         }
 
         // Never overwrite local bytes the user never uploaded without keeping a copy.
-        match self.guard_overwrite(book, &remote.content_hash, &remote.id, reason) {
+        match self.guard_overwrite(book, &remote.content_hash, Some(&remote.id), reason) {
             Guard::Proceed => {}
             Guard::Deferred => return tracing::debug!("{id}: save file busy, deferring pull"),
             Guard::Aborted => return,
@@ -454,7 +559,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
     /// uploaded. `last_synced_hash` is deliberately *not* trusted here, since the
     /// map-time "use the server's copy" path seeds it to the local hash for bytes
     /// that were never sent anywhere.
-    fn guard_overwrite(&self, book: &InstanceRecord, incoming_hash: &str, server_save_id: &str, reason: &'static str) -> Guard {
+    fn guard_overwrite(&self, book: &InstanceRecord, incoming_hash: &str, server_save_id: Option<&str>, reason: &'static str) -> Guard {
         let bytes = match disk::read_bytes(&book.save_path) {
             Ok(Some(bytes)) if !bytes.is_empty() => bytes,
             Ok(_) => return Guard::Proceed, // nothing on disk to keep
@@ -472,7 +577,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
             self.emit(EngineEvent::Error(format!("backup {}: {e}", book.save_path.display())));
             return Guard::Aborted;
         }
-        let record = Store::write(|s| s.insert_backup(&book.game_instance_id, &book.save_path, &hash, bytes.len() as u64, incoming_hash, Some(server_save_id), reason));
+        let record = Store::write(|s| s.insert_backup(&book.game_instance_id, &book.save_path, &hash, bytes.len() as u64, incoming_hash, server_save_id, reason));
         if let Err(e) = record {
             self.emit(EngineEvent::Error(format!("backup record: {e:#}")));
             return Guard::Aborted;
@@ -640,6 +745,16 @@ fn write_backup_blob(dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()
         return Ok(());
     }
     write_atomic(&path, bytes)
+}
+
+/// Read a backup blob written by [`write_backup_blob`]. `Ok(None)` if it isn't
+/// there (pruned, or a stale index row).
+fn read_backup_blob(dir: &Path, hash: &str) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(dir.join(hash)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// A best-effort `SaveMeta` for a save we just uploaded, before the stream's

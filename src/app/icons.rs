@@ -14,3 +14,4 @@ pub const WRENCH: &str = "\u{E5D4}";
 pub const SIGN_OUT: &str = "\u{E42A}";
 pub const POWER: &str = "\u{E3DA}";
 pub const WARNING: &str = "\u{E4E0}";
+pub const RESTORE: &str = "\u{E1A0}";
