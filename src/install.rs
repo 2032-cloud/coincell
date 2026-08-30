@@ -257,10 +257,8 @@ mod imp {
     }
 
     pub(super) fn unregister() {
-        for p in [menu_desktop(), autostart_desktop(), icon_path()] {
-            if let Ok(p) = p {
-                let _ = std::fs::remove_file(p);
-            }
+        for p in [menu_desktop(), autostart_desktop(), icon_path()].into_iter().flatten() {
+            let _ = std::fs::remove_file(p);
         }
     }
 
