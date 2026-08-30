@@ -9,9 +9,8 @@ name: Release
 # PREREQUISITES (one-time, see design.md "Updater"):
 #   - assets/minisign.pub committed to the repo (the public verify key).
 #   - repo secret MINISIGN_SECRET_KEY = the full contents of the minisign secret
-#     key file (generated unencrypted with `rsign generate -W`).
-#   - (optional) repo secret MINISIGN_PASSWORD if the key IS password-protected;
-#     uncomment the stdin pipe in the Sign step below.
+#     key file, generated with NO password (`rsign generate -W` /
+#     `minisign -G -W`). The Sign step passes `-W` and can't prompt in CI.
 
 on:
   push:
@@ -128,10 +127,11 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
           art="${{ steps.package.outputs.artifact }}"
           comment="coincell ${GITHUB_REF_NAME} ${{ matrix.target }}"
-          # Unencrypted key (rsign generate -W): no password needed.
-          rsign sign -s minisign.key -x "$art.minisig" -t "$comment" -c "$comment" "$art"
-          # Password-protected key instead? use:
-          #   printf '%s\n' "$MINISIGN_PASSWORD" | rsign sign -s minisign.key -x "$art.minisig" -t "$comment" "$art"
+          # -W: decrypt a no-password key non-interactively. A minisign/rsign key
+          # made with `-W` still carries an empty-password KDF, so `sign` would
+          # otherwise try to prompt (no TTY in CI -> "os error 6" on Linux, hang
+          # on Windows). Real-password keys aren't supported here; regenerate -W.
+          rsign sign -W -s minisign.key -x "$art.minisig" -t "$comment" -c "$comment" "$art"
           rm -f minisign.key
           if [ -f assets/minisign.pub ]; then
             rsign verify -p assets/minisign.pub -x "$art.minisig" "$art"
