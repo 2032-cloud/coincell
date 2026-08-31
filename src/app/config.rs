@@ -91,6 +91,8 @@ impl Section {
 #[derive(Default)]
 struct Drafts {
     api_base: String,
+    /// `[sync].emulators`, one per line, committed on focus-loss.
+    emulators: String,
 }
 
 /// A pending inline confirm in the Backups section, keyed to a `save_backups.id`.
@@ -135,6 +137,7 @@ impl ConfigApp {
         self.backup_confirm = None;
         self.confirm_uninstall = false;
         self.drafts.api_base = Config::get(|c| c.advanced.api_base.to_string());
+        self.drafts.emulators = Config::get(|c| c.sync.emulators.join("\n"));
     }
 
     pub fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {}
@@ -296,12 +299,32 @@ impl ConfigApp {
             });
             ui.add_space(4.0);
             changed |= ui.checkbox(&mut s.pause_on_metered, "Pause on a metered connection").changed();
+            ui.add_space(4.0);
+            changed |= ui.checkbox(&mut s.watch_emulators, "Sync when an emulator starts or exits").changed();
         });
 
         if changed {
             let r = Config::update(|c| c.sync = s.clone());
             self.note_save(r);
         }
+
+        ui.add_enabled_ui(s.enabled && s.watch_emulators, |ui| {
+            ui.collapsing("Watched emulators", |ui| {
+                ui.small("Executable names, one per line (extension optional). Matched against every running process.");
+                let resp = ui.add(egui::TextEdit::multiline(&mut self.drafts.emulators).desired_rows(6).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                if resp.lost_focus() {
+                    let list: Vec<String> = {
+                        let mut seen = std::collections::HashSet::new();
+                        self.drafts.emulators.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty() && seen.insert(l.clone())).collect()
+                    };
+                    if list != Config::get(|c| c.sync.emulators.clone()) {
+                        let r = Config::update(|c| c.sync.emulators = list);
+                        self.note_save(r);
+                    }
+                    self.drafts.emulators = Config::get(|c| c.sync.emulators.join("\n"));
+                }
+            });
+        });
 
         ui.add_space(10.0);
         let sync_now = ui.add_enabled(s.enabled, egui::Button::new("Sync now")).on_hover_text("Check the server for changes right now").clicked();
@@ -420,6 +443,12 @@ impl ConfigApp {
             let r = Config::update(|c| c.notifications = n);
             self.note_save(r);
         }
+
+        ui.add_space(8.0);
+        if ui.button("Send a test notification").clicked() {
+            crate::notice::send_test();
+        }
+        ui.small("Ignores the checkboxes above, so you can confirm your desktop shows toasts.");
     }
 
     fn appearance(&mut self, ui: &mut egui::Ui) {
@@ -486,6 +515,9 @@ impl ConfigApp {
                 ui.add_space(2.0);
                 ui.small(notes);
             }
+        }
+        if let Ok(Some(ts)) = Store::get(|s| s.last_update_check()) {
+            ui.small(format!("Last checked {}.", humanize_since(&ts)));
         }
         ui.add_space(6.0);
 

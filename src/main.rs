@@ -5,6 +5,7 @@ mod app;
 mod asset;
 mod config;
 mod constants;
+mod emulator_watch;
 mod install;
 mod ipc;
 mod logging;
@@ -13,6 +14,7 @@ mod placement;
 mod store;
 mod sync;
 mod theme;
+mod toast;
 mod tray;
 mod update;
 mod version;
@@ -58,8 +60,8 @@ fn main() -> anyhow::Result<()> {
     store::Store::init();
     // Stamp every device-API request with our version.
     api::set_user_agent(USER_AGENT.as_str());
-    // User-facing notifications only log for now. A real OS toast sink plugs in
-    // here via `notice::set_sink(..)` once a backend is chosen.
+    // Route user-facing notices to real OS toasts (log-only until now).
+    toast::install();
 
     // The device API's Auth0 parameters. Fetched once from whatever `api_base`
     // the config points at (the default, or a dev/self-host override).

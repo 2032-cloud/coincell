@@ -114,7 +114,16 @@ fn run(client: Client, since: Option<String>, fallback: Option<Duration>, tx: Se
                 let _ = tx.send(SyncEvent::Disconnected { reason });
                 wake();
             }
-            Some(StreamEvent::SaveChanged { instance_id }) => {
+            Some(StreamEvent::SaveChanged { instance_id, save: Some(save) }) => {
+                // Newer server inlined the save row: act on it, no HTTP.
+                if cursor.as_deref().is_none_or(|c| save.uploaded_at.as_str() > c) {
+                    cursor = Some(save.uploaded_at.as_str().to_owned());
+                }
+                let _ = tx.send(SyncEvent::Changed { instance_id, latest: save });
+                wake();
+                last_fallback = Instant::now();
+            }
+            Some(StreamEvent::SaveChanged { instance_id, save: None }) => {
                 let emitted = poll_and_emit(&client, &mut cursor, &tx, &wake);
                 backfill_one(&client, &instance_id, &emitted, &tx, &wake);
                 want_poll = false;

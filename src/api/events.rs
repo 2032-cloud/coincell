@@ -1,10 +1,10 @@
 //! Realtime notifications from `GET /api/events` (a WebSocket).
 //!
-//! The server sends `{"type":"save","instanceId":"…"}` whenever another device
-//! uploads a genuinely new save. It's a pure relay with no backfill, a missed
-//! message is caught by the next `?since=` poll, so this type only surfaces
-//! "instance X changed", never the save itself. Reconnects on its own with
-//! backoff.
+//! The server sends `{"type":"save","instance_id":"…","save":{…}}` whenever
+//! another device uploads a genuinely new save. When the nested `save` object is
+//! present the client acts on it directly; when it's absent (older server) the
+//! consumer falls back to a `?since=` poll. A missed message is always caught by
+//! the next poll regardless. Reconnects on its own with backoff.
 
 use std::io::ErrorKind;
 use std::net::TcpStream;
@@ -18,12 +18,15 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+use crate::api::SaveMeta;
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// The socket is up (fired on every (re)connect).
     Connected,
-    /// A new save landed for this instance elsewhere. Fetch details with a poll.
-    SaveChanged { instance_id: String },
+    /// A new save landed for this instance elsewhere. `save` is the full row
+    /// when the server inlined it; `None` means "fetch details with a poll".
+    SaveChanged { instance_id: String, save: Option<SaveMeta> },
     /// The socket dropped; a reconnect attempt follows.
     Disconnected { reason: String },
 }
@@ -32,8 +35,11 @@ pub enum StreamEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Wire {
     Save {
-        #[serde(rename = "instanceId")]
+        #[serde(alias = "instanceId")]
         instance_id: String,
+        /// Present on newer servers: the uploaded save's metadata, so the
+        /// client can skip the follow-up `?since=` poll.
+        save: Option<SaveMeta>,
     },
     #[serde(other)]
     Unknown,
@@ -125,8 +131,8 @@ fn connect_once(url: &str, session: &str, tx: &Sender<StreamEvent>, stop: &Atomi
 
         match socket.read() {
             Ok(Message::Text(text)) => {
-                if let Ok(Wire::Save { instance_id }) = serde_json::from_str(text.as_str()) {
-                    let _ = tx.send(StreamEvent::SaveChanged { instance_id });
+                if let Ok(Wire::Save { instance_id, save }) = serde_json::from_str(text.as_str()) {
+                    let _ = tx.send(StreamEvent::SaveChanged { instance_id, save });
                     wake();
                 }
             }

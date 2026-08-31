@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 sentry = { version = "0.49.2", default-features = false, features = ["backtrace", "contexts", "panic", "tracing", "reqwest", "rustls"] }
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+notify-rust = "4"           # OS toast notifications: zbus/D-Bus (Linux), WinRT (Windows)
 # self-install + self-update
 self-replace = "1"
 minisign-verify = "0.2"

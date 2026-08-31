@@ -193,12 +193,66 @@ pub struct SyncSettings {
     pub conflict: ConflictPolicy,
     /// Pause network activity on a metered connection (Windows).
     pub pause_on_metered: bool,
+    /// Nudge the sync engine when a watched emulator starts or exits.
+    pub watch_emulators: bool,
+    /// Executable basenames (no extension) the watcher looks for.
+    #[serde(default = "default_emulators")]
+    pub emulators: Vec<String>,
 }
 
 impl Default for SyncSettings {
     fn default() -> Self {
-        Self { enabled: true, poll: PollInterval::Auto, upload_trigger: UploadTrigger::OnChange, conflict: ConflictPolicy::Ask, pause_on_metered: true }
+        Self {
+            enabled: true,
+            poll: PollInterval::Auto,
+            upload_trigger: UploadTrigger::OnChange,
+            conflict: ConflictPolicy::Ask,
+            pause_on_metered: true,
+            watch_emulators: true,
+            emulators: default_emulators(),
+        }
     }
+}
+
+/// A broad starting set of emulator executable names, editable in Config › Sync.
+fn default_emulators() -> Vec<String> {
+    [
+        "retroarch",
+        "dolphin",
+        "dolphin-emu",
+        "pcsx2",
+        "pcsx2-qt",
+        "duckstation",
+        "duckstation-qt",
+        "ppsspp",
+        "ppssppsdl",
+        "ppssppwindows",
+        "mgba",
+        "mgba-qt",
+        "snes9x",
+        "snes9x-gtk",
+        "bsnes",
+        "mesen",
+        "melonds",
+        "desmume",
+        "citra",
+        "lime3ds",
+        "azahar",
+        "mupen64plus",
+        "simple64",
+        "flycast",
+        "cemu",
+        "xemu",
+        "fceux",
+        "nestopia",
+        "vbam",
+        "visualboyadvance-m",
+        "sameboy",
+        "openemu",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

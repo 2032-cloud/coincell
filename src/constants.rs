@@ -10,6 +10,13 @@ pub const API_BASE_ROUTE: &str = "https://cr.2032.cloud";
 
 // IPC CONSTANTS
 pub const IPC_NAME: &str = "com.p51.coincell"; // IPC Channel Name (auto converted to platform specific paths)
+
+/// Windows AppUserModelID: what Windows attributes our toast notifications to.
+/// Must stay stable across versions and match the value registered under
+/// `HKCU\Software\Classes\AppUserModelId\`. Mirrors the `ProjectDirs`
+/// qualifier/org/app.
+#[cfg(windows)]
+pub const APP_USER_MODEL_ID: &str = "com.p51.CoinCell";
 pub const WAKE_WORD: &[u8] = b"WAKE UP"; // IPC Wake Word (keyword sent through channel to wake gui)
 
 // DISPLAY CONSTANTS

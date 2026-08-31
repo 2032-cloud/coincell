@@ -6,7 +6,7 @@ mod mapping;
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -15,9 +15,10 @@ use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, 
 use crate::app::config::{ConfigApp, ConfigOutcome};
 use crate::app::home::{HomeApp, HomeOutcome, HomeView};
 use crate::app::icons::MINIMISE;
-use crate::config::Config;
+use crate::config::{Config, UpdateAction, UpdateChannel};
 use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
+use crate::store::Store;
 use crate::sync::{EngineEvent, RestoreSource, SyncEngine};
 use crate::theme::{self, Scheme};
 use crate::update::{self, Available};
@@ -151,6 +152,12 @@ pub struct App {
     config_app: ConfigApp,
     home_app: HomeApp,
     updater: Updater,
+    /// When the next automatic update check is due (`[updates].auto_check`).
+    /// `None` while auto-check is off or a check is in flight.
+    next_update_check: Option<Instant>,
+    /// The in-flight check was started by the timer, so `drain_updater` should
+    /// apply `[updates].on_update` when it resolves.
+    auto_check_pending: bool,
 }
 
 impl App {
@@ -195,6 +202,8 @@ impl App {
             config_app: ConfigApp::new(),
             home_app: HomeApp::new(),
             updater: Updater::Idle,
+            next_update_check: None,
+            auto_check_pending: false,
         }
     }
 
@@ -297,12 +306,14 @@ impl App {
         self.home_app.deliver_save_pick(&instance_id, result);
     }
 
-    /// Kick off a GitHub Releases check on a worker thread.
-    fn start_update_check(&mut self, ctx: &egui::Context) {
+    /// Kick off a GitHub Releases check on a worker thread. `auto` marks it as
+    /// timer-driven so `drain_updater` applies `[updates].on_update` on finish.
+    fn start_update_check(&mut self, ctx: &egui::Context, auto: bool) {
         if self.updater.busy() {
             return;
         }
-        let allow_prerelease = Config::get(|c| c.updates.channel) == crate::config::UpdateChannel::Prerelease;
+        self.auto_check_pending = auto;
+        let allow_prerelease = Config::get(|c| c.updates.channel) == UpdateChannel::Prerelease;
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::Builder::new()
@@ -313,6 +324,41 @@ impl App {
             })
             .expect("spawn update-check thread");
         self.updater = Updater::Checking(rx);
+    }
+
+    /// Work out when the next automatic check is due from the last persisted
+    /// check and `[updates].check_interval`; an overdue / never-run check is
+    /// scheduled a short way out so launch isn't hammered.
+    fn schedule_update_check(&mut self) {
+        const SOON: Duration = Duration::from_secs(45);
+        let interval = Config::get(|c| c.updates.check_interval.0);
+        let elapsed = Store::get(|s| s.last_update_check()).ok().flatten().and_then(|ts| crate::sync::parse_utc(&ts)).map(|then| Duration::from_secs((crate::sync::now_epoch() - then).max(0) as u64));
+        let wait = match elapsed {
+            Some(e) if e < interval => (interval - e).max(SOON),
+            _ => SOON,
+        };
+        self.next_update_check = Some(Instant::now() + wait);
+    }
+
+    /// Fire an automatic check when one is due. Called every `logic()` tick.
+    fn tick_update_check(&mut self, ctx: &egui::Context) {
+        if !crate::version::is_release() {
+            return;
+        }
+        if !Config::get(|c| c.updates.auto_check) {
+            self.next_update_check = None;
+            return;
+        }
+        // Don't stomp an in-flight check or an already-surfaced offer.
+        if self.updater.busy() || self.updater.offer().is_some() {
+            return;
+        }
+        if self.next_update_check.is_none() {
+            self.schedule_update_check();
+        }
+        if self.next_update_check.is_some_and(|due| Instant::now() >= due) {
+            self.start_update_check(ctx, true);
+        }
     }
 
     /// Download + verify + swap the pending update on a worker thread.
@@ -332,8 +378,9 @@ impl App {
         self.updater = Updater::Installing(rx);
     }
 
-    /// Advance the updater state machine; on a finished install, shut down so the
-    /// relaunched process can take over.
+    /// Advance the updater state machine. On a finished auto-check, record the
+    /// time and apply `[updates].on_update`; on a finished install, shut down so
+    /// the relaunched process can take over.
     fn drain_updater(&mut self, ctx: &egui::Context) {
         let next = match &self.updater {
             Updater::Checking(rx) => match rx.try_recv() {
@@ -350,15 +397,31 @@ impl App {
             },
             _ => None,
         };
-        if let Some(state) = next {
-            let restarting = matches!(state, Updater::Restarting);
-            self.updater = state;
-            if restarting {
-                tracing::info!("update applied; closing so the new build can relaunch");
-                self.sync = None;
-                self.quitting = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        let Some(state) = next else { return };
+
+        let check_finished = matches!(self.updater, Updater::Checking(_));
+        let was_auto = std::mem::take(&mut self.auto_check_pending);
+        self.updater = state;
+
+        if check_finished {
+            let _ = Store::write(|s| s.set_last_update_check(&crate::sync::now_utc_string()));
+            self.schedule_update_check();
+            if was_auto && let Updater::Checked(Some(av)) = &self.updater {
+                let version = av.version.to_string();
+                tracing::info!("auto update check: {version} available");
+                match Config::get(|c| c.updates.on_update) {
+                    // `download` pre-staging isn't built yet; surface it like `notify`.
+                    UpdateAction::Notify | UpdateAction::Download => notice::post(Notice::UpdateReady { version }),
+                    UpdateAction::Install => self.start_update_install(ctx),
+                }
             }
+        }
+
+        if matches!(self.updater, Updater::Restarting) {
+            tracing::info!("update applied; closing so the new build can relaunch");
+            self.sync = None;
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -389,6 +452,8 @@ impl App {
         self.ask_crash_reports = false;
         self.ask_install = false;
         self.ask_tray_intro = false;
+        self.next_update_check = None;
+        self.auto_check_pending = false;
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -656,6 +721,7 @@ impl App {
                 self.auth = AuthView::Ready;
                 self.focus_latch = true;
                 self.advance_first_run_prompts();
+                self.schedule_update_check();
                 self.start_sync(ctx);
             }
             Next::Revalidate => match api_client() {
@@ -791,6 +857,7 @@ impl eframe::App for App {
         self.drain_sync(ctx);
         notice::pump();
         self.drain_pending_pick();
+        self.tick_update_check(ctx);
         self.drain_updater(ctx);
         self.sync_shown_screen();
         self.reconcile_visibility(ctx);
@@ -857,7 +924,7 @@ impl eframe::App for App {
                             engine.restore(&instance_id, RestoreSource::Backup { content_hash });
                         }
                     }
-                    ConfigOutcome::CheckForUpdate => self.start_update_check(ui.ctx()),
+                    ConfigOutcome::CheckForUpdate => self.start_update_check(ui.ctx(), false),
                     ConfigOutcome::InstallUpdate => self.start_update_install(ui.ctx()),
                     ConfigOutcome::RelaunchFrom(path) => self.relaunch_from(ui.ctx(), path),
                     ConfigOutcome::LogOut => self.begin_logout(ui.ctx()),

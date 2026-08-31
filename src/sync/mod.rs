@@ -15,7 +15,7 @@ mod time;
 pub use disk::{LocalFile, write_atomic};
 pub use hash::sha256_hex;
 pub use reconcile::{Action, reconcile};
-pub use time::humanize_since;
+pub use time::{humanize_since, now_epoch, now_utc_string, parse_utc};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -135,6 +135,10 @@ impl SyncEngine {
         let stop_worker = Arc::clone(&stop);
 
         std::thread::Builder::new().name("sync-engine".into()).spawn(move || Worker::start(client, tx, control_rx, stop_worker, wake).run()).expect("spawn sync-engine thread");
+
+        // A sibling watcher: nudges this engine when an emulator starts / exits.
+        // It shares `stop`, so it dies with the engine.
+        crate::emulator_watch::spawn(control_tx.clone(), Arc::clone(&stop));
 
         Self { rx, control: control_tx, stop }
     }

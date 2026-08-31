@@ -155,6 +155,16 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     imp::set_autostart(enabled)
 }
 
+/// Best-effort: make Windows attribute our toast notifications to "CoinCell"
+/// (writes an HKCU AppUserModelID class key). No-op on other platforms and if it
+/// can't write. Called from `main` at startup so loose runs get branded toasts
+/// too, and from [`register`] on a real install.
+pub fn ensure_app_id() {
+    if let Err(e) = imp::ensure_app_id() {
+        tracing::debug!("toast app-id registration skipped: {e}");
+    }
+}
+
 fn register() -> Result<()> {
     imp::register()?;
     let want = crate::config::Config::get(|c| c.startup.launch_on_login);
@@ -174,9 +184,36 @@ mod imp {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
+    use crate::constants::{APP_USER_MODEL_ID, ICON_BYTES};
+
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     fn arp_key() -> String {
         format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}")
+    }
+    fn app_id_key() -> String {
+        format!(r"Software\Classes\AppUserModelId\{APP_USER_MODEL_ID}")
+    }
+
+    /// `icon.png` next to the installed exe - what the AppUserModelID key points
+    /// `IconUri` at, so Windows renders our toasts with the real logo.
+    fn toast_icon() -> Result<PathBuf> {
+        Ok(canonical_exe()?.with_file_name("icon.png"))
+    }
+
+    /// Register the HKCU AppUserModelID class key (`DisplayName`, `IconUri`) so
+    /// toasts stamped with [`APP_USER_MODEL_ID`] render as "CoinCell". Idempotent
+    /// and HKCU-only, so it's safe to call from an uninstalled/loose run - the
+    /// `IconUri` is just skipped when the icon file isn't there.
+    pub(super) fn ensure_app_id() -> Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu.create_subkey(app_id_key())?;
+        key.set_value("DisplayName", &APP_NAME)?;
+        if let Ok(icon) = toast_icon()
+            && icon.is_file()
+        {
+            key.set_value("IconUri", &icon.to_string_lossy().into_owned())?;
+        }
+        Ok(())
     }
 
     pub(super) fn register() -> Result<()> {
@@ -197,8 +234,8 @@ mod imp {
         arp.set_value("NoRepair", &1u32)?;
 
         // Start Menu shortcut, so typing "CoinCell" in the Start menu finds it.
-        // TODO(notifications): give this shortcut an AppUserModelID (needs COM /
-        // IPropertyStore) so Windows toasts render as "CoinCell".
+        // (Toast identity is the HKCU AppUserModelId class key written below, not
+        // a shortcut property - simpler for an unpackaged app on Win10 1809+.)
         let lnk = start_menu_lnk()?;
         if let Some(dir) = lnk.parent() {
             std::fs::create_dir_all(dir)?;
@@ -208,6 +245,12 @@ mod imp {
         sl.set_working_dir(Some(dir_s.clone()));
         sl.set_icon_location(Some(exe_s.clone()));
         sl.create_lnk(&lnk).map_err(|e| anyhow::anyhow!("write {}: {e}", lnk.display()))?;
+
+        // Branded toast notifications: an icon next to the exe, plus the HKCU
+        // AppUserModelID the toast sink stamps on every notification.
+        let icon = toast_icon()?;
+        std::fs::write(&icon, ICON_BYTES).with_context(|| format!("write {}", icon.display()))?;
+        ensure_app_id()?;
         Ok(())
     }
 
@@ -219,6 +262,10 @@ mod imp {
     pub(super) fn unregister() {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let _ = hkcu.delete_subkey_all(arp_key());
+        let _ = hkcu.delete_subkey_all(app_id_key());
+        if let Ok(icon) = toast_icon() {
+            let _ = std::fs::remove_file(icon);
+        }
         if let Ok(lnk) = start_menu_lnk() {
             let _ = std::fs::remove_file(lnk);
         }
@@ -297,6 +344,12 @@ mod imp {
         for p in [menu_desktop(), autostart_desktop(), icon_path()].into_iter().flatten() {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Nothing to do: the freedesktop notification spec takes the app icon from
+    /// the `.desktop` name / the `app_icon` hint, both already handled.
+    pub(super) fn ensure_app_id() -> Result<()> {
+        Ok(())
     }
 
     pub(super) fn set_autostart(enabled: bool) -> Result<()> {

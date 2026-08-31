@@ -6,10 +6,9 @@
 //! collapses repeats: the same notice inside [`DEDUP_WINDOW`] is dropped, so a
 //! burst of pulls or a flapping conflict is one line, not ten.
 //!
-//! The delivery backend is deliberately unfinished. The only [`Sink`] wired
-//! today is [`LogSink`], a `tracing` line. A real OS toast sink (notify-rust, or
-//! a hand rolled per platform one, undecided) slots in through [`set_sink`] in
-//! `main` with no change to any call site.
+//! Delivery goes through a [`Sink`]. The default is [`LogSink`] (a `tracing`
+//! line); `main` swaps in `crate::toast::ToastSink` (real OS toasts, via
+//! notify-rust) through [`set_sink`] with no change to any call site.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -35,6 +34,11 @@ pub enum Notice {
     Error { detail: String },
     /// The session died mid sync and the app signed out.
     SessionExpired,
+    /// An automatic update check found a newer release (`on_update = notify`).
+    UpdateReady { version: String },
+    /// A canned notice fired by the Config "Send a test notification" button.
+    /// Delivered straight to the sink by [`send_test`], past the gate and dedup.
+    Test,
 }
 
 impl Notice {
@@ -45,6 +49,8 @@ impl Notice {
             Notice::Conflict { .. } => "Sync conflict",
             Notice::Error { .. } => "Sync problem",
             Notice::SessionExpired => "Signed out",
+            Notice::UpdateReady { .. } => "Update available",
+            Notice::Test => "CoinCell",
         }
     }
 
@@ -55,6 +61,8 @@ impl Notice {
             Notice::Conflict { game } => format!("{game} changed here and on another device. Open coincell to choose which to keep."),
             Notice::Error { detail } => detail.clone(),
             Notice::SessionExpired => "Your session expired. Sign in again to keep syncing.".to_owned(),
+            Notice::UpdateReady { version } => format!("CoinCell {version} is ready to install (Config \u{203a} Updates)."),
+            Notice::Test => "Notifications are working.".to_owned(),
         }
     }
 
@@ -65,10 +73,14 @@ impl Notice {
             Notice::Conflict { game } => format!("conflict:{game}"),
             Notice::Error { detail } => format!("error:{detail}"),
             Notice::SessionExpired => "session-expired".to_owned(),
+            Notice::UpdateReady { version } => format!("update:{version}"),
+            Notice::Test => "test".to_owned(),
         }
     }
 
-    /// `[notifications]` gate: master switch and the matching per kind flag.
+    /// `[notifications]` gate: master switch, and the matching per-kind flag for
+    /// the sync notices. `UpdateReady` has no per-kind flag - `[updates].on_update
+    /// = notify` is already that opt-in - so it rides the master switch alone.
     fn allowed_by(&self, n: &Notifications) -> bool {
         n.enabled
             && match self {
@@ -76,6 +88,8 @@ impl Notice {
                 Notice::Conflict { .. } => n.on_conflict,
                 Notice::Error { .. } => n.on_error,
                 Notice::SessionExpired => n.on_session_expired,
+                Notice::UpdateReady { .. } => true,
+                Notice::Test => true,
             }
     }
 }
@@ -139,11 +153,17 @@ fn sink() -> &'static dyn Sink {
 
 /// Install the real delivery backend. Call once, from `main`, before the UI
 /// starts. A second call is ignored with a warning.
-#[allow(dead_code)] // wired from `main` once an OS toast backend is picked
 pub fn set_sink(backend: Box<dyn Sink>) {
     if SINK.set(backend).is_err() {
         tracing::warn!("notice sink already set");
     }
+}
+
+/// Deliver a canned notice straight to the sink, past the config gate and the
+/// dedup window. Backs the Config > Notifications "Send a test notification"
+/// button: confirms OS delivery independent of the per-kind toggles.
+pub fn send_test() {
+    sink().deliver(&Notice::Test);
 }
 
 /// Queue a notice. Cheap and thread safe: gates on `[notifications]`, dedupes,
@@ -176,6 +196,12 @@ mod tests {
 
     fn all_on(enabled: bool) -> Notifications {
         Notifications { enabled, on_pull: true, on_conflict: true, on_error: true, on_session_expired: true }
+    }
+
+    #[test]
+    fn test_notice_is_self_describing() {
+        assert_eq!(Notice::Test.title(), "CoinCell");
+        assert!(!Notice::Test.body().is_empty());
     }
 
     #[test]

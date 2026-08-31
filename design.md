@@ -16,9 +16,11 @@ resolution, save-history restore), and the **Home window** (`src/app/home.rs` -
 the game list, local search, the add-game flow, the instance detail page, and the
 per-game save-history screen), **build-time versioning** (`build.rs` +
 `src/version.rs`), and **CI + release workflows** (`.github/workflows/`, signed
-GitHub Releases on `v*` tags), **self-install** (`src/install.rs`), and the
-**self-updater** (`src/update.rs`, manual "check for updates" so far). Not
-started: the tray menu, automatic update checks, the OS-toast notification sink.
+GitHub Releases on `v*` tags), **self-install** (`src/install.rs`), the
+**self-updater** (`src/update.rs`, manual + automatic checks), the **emulator
+watch** (`src/emulator_watch.rs`), and the **OS-toast notification sink**
+(`src/toast.rs`, `notify-rust`). Not started: the tray popup menu (decided
+against - click routing instead).
 
 ## What coincell is
 
@@ -47,7 +49,11 @@ started: the tray menu, automatic update checks, the OS-toast notification sink.
   download raw bytes
 - `GET /api/events` - WebSocket upgrade (sessionBearer); the realtime
   save-updated stream, one per-user Durable Object behind it (see Download
-  direction)
+  direction). Message: `{"type":"save","instance_id":…}`, ideally with an inlined
+  `"save":{id,content_hash,size_bytes,uploaded_at,starred,note}` so the client
+  acts without a follow-up poll. The DO relays to every socket including the
+  uploader's (harmless echo → `MarkSynced`), so a client can also use it to
+  confirm its own upload made it through.
 - `GET /api/consoles`, `GET /api/consoles/:slug/games` - public catalog + art.
   Consoles carry `validSaveSizes: number[]`, the only save-size check we need. A
   game's `name` is already resolved for the account's `preferred_region`
@@ -95,17 +101,19 @@ it needs is passed in, so it can be lifted into its own crate later. The old
   `revoke_in_background`, `open_in_browser`. Each spawner takes a
   `wake: impl Fn()` - the app passes `ctx.request_repaint`, a library `|| {}`.
 - `events` - `EventStream`: a `tungstenite` (blocking, rustls) WebSocket to
-  `/api/events`. Parses `{"type":"save","instanceId":…}` into
-  `StreamEvent::{Connected, SaveChanged, Disconnected}`, self-reconnects with
-  backoff, uses a 500 ms socket read-timeout to stay responsive to `stop()` and
-  to flush keepalive pongs.
+  `/api/events`. Parses `{"type":"save","instance_id":…,"save":{…}?}` into
+  `StreamEvent::{Connected, SaveChanged { instance_id, save: Option<SaveMeta> },
+  Disconnected}` (`instance_id` also accepts the legacy `instanceId` alias),
+  self-reconnects with backoff, 500 ms socket read-timeout to stay responsive to
+  `stop()` and flush keepalive pongs.
 - `sync` - `SyncStream`: the stateful orchestration. Opens the `EventStream`
-  **before** the first poll (no gap), does a full hydrate (emits `Synced`), then
-  on each WS ping / `poll_now()` / fallback tick re-polls `?since=cursor` and
-  emits `Changed { instance_id, latest }`, advancing the cursor by max
-  `last_saved_at`. Same-second boundary is covered by a targeted `saves()` fetch
-  when the stream names an instance the poll didn't return. On reconnect it
-  re-polls from the cursor. Also emits `Connected` / `Disconnected` / `Error` /
+  **before** the first poll (no gap), does a full hydrate (emits `Synced`), then:
+  a `SaveChanged` **with** an inlined `save` object → emit `Changed { instance_id,
+  latest }` directly and bump the cursor by `save.uploaded_at`, **no HTTP**; a
+  `SaveChanged` **without** it (older server), a `poll_now()`, a fallback tick, or
+  a reconnect → re-poll `?since=cursor` and emit a `Changed` per instance,
+  advancing the cursor by max `last_saved_at`, with a targeted `saves()` fetch
+  covering the same-second boundary. Also emits `Connected` / `Disconnected` / `Error` /
   `Unauthorized` (a `401`/`403` gets its own variant, not a generic error
   string). It does **not** touch the filesystem or a store - that's the engine.
 
@@ -186,6 +194,8 @@ poll = "auto"                 # "auto" | "30s" | "5m" | "off"
 upload_trigger = "on-change"  # "on-change" (debounced) | "on-emulator-exit" | "manual"
 conflict = "ask"              # "ask" | "prefer-local" | "prefer-remote" | "prefer-newest"
 pause_on_metered = true       # Windows metered-connection awareness
+watch_emulators = true        # nudge sync when a watched emulator starts / exits
+emulators = ["retroarch", …] # executable basenames (no ext); a broad default set
 
 [notifications]
 enabled = true
@@ -274,10 +284,12 @@ Rail sections:
 6. **Updates** - current version (`version::VERSION`, resolved from git at build
    time - see Versioning; a "development build" note shows when
    `!version::is_release()`), channel, check-automatically, on-update action, a
-   **Check for updates** button + status line, and a **Download & install**
-   button once a newer release is found. Drives `App::updater` (see Updater).
-   _(Automatic checks on `check_interval` and the `on_update` = download/install
-   actions aren't wired yet - the button is manual-only.)_
+   **Check for updates** button + status line, a "last checked N ago" line, and a
+   **Download & install** button once a newer release is found. Drives
+   `App::updater` (see Updater). Automatic background checks on
+   `[updates].check_interval` run too; `[updates].on_update` = `notify` posts a
+   `Notice`, `install` auto-applies. _(`download` pre-staging isn't built -
+   treated as `notify`.)_
 7. **Save backups** - every pre-overwrite local snapshot the engine has kept
    (`Store::backups()`), newest first, labelled by game (name resolved from the
    catalog, else the raw instance id + original path for a deleted game). This is
@@ -501,25 +513,39 @@ closures through a `Cell<Option<HistAction>>` and applied after the scroll area.
 
 ## Notifications
 
-**STARTED** (`src/notice.rs`). A process-wide queue any thread posts to;
-`App::logic` calls `notice::pump()` once a frame to drain it to a `Sink`.
+**BUILT** (`src/notice.rs` + `src/toast.rs`). A process-wide queue any thread
+posts to; `App::logic` calls `notice::pump()` once a frame to drain it to a
+`Sink`.
 
-- `Notice::{Pulled, Conflict, Error, SessionExpired}`, one per `[notifications]`
-  toggle. `post()` reads `[notifications]` and drops a notice whose master or
-  per-kind flag is off, then dedupes by `dedup_key` (e.g. `conflict:<game>`):
-  the same notice inside a 10s window is dropped, so a burst of pulls or a
-  flapping conflict is one line, not ten. `Queue::admit` is the pure
-  (config + `now` in, bool out) core, unit-tested.
-- **The delivery backend is deliberately unbuilt.** `Sink` has one impl,
-  `LogSink` (a `tracing` line), as the default. A real OS-toast sink
-  (`notify-rust`, or a hand-rolled per-platform one, undecided, see the tray /
-  notification tradeoff notes) drops in via `notice::set_sink` in `main` with no
-  change to any call site. Until then notices land only in the log.
+- `Notice::{Pulled, Conflict, Error, SessionExpired, UpdateReady, Test}`, one per
+  `[notifications]` toggle (`UpdateReady` / `Test` ride the master switch alone).
+  `post()` reads `[notifications]` and drops a notice whose master or per-kind
+  flag is off, then dedupes by `dedup_key` (e.g. `conflict:<game>`): the same
+  notice inside a 10s window is dropped, so a burst of pulls or a flapping
+  conflict is one line, not ten. `Queue::admit` is the pure (config + `now` in,
+  bool out) core, unit-tested.
+- **Delivery: `notify-rust`.** `toast::install()` (from `main`, once) swaps the
+  default `LogSink` for `ToastSink`. It builds one `notify_rust::Notification`
+  per notice on a dedicated `toast` worker thread - `pump` runs on the UI thread
+  and the `Sink` contract forbids blocking it; both notify-rust backends
+  (zbus/D-Bus on Linux, WinRT on Windows) can stall briefly. One crate covers
+  both targets; the Linux path is pure-Rust zbus (no `libdbus`).
+  - **Windows branding**: toasts carry `.app_id(constants::APP_USER_MODEL_ID)`
+    (`com.p51.CoinCell`). `install::ensure_app_id()` writes the matching
+    `HKCU\Software\Classes\AppUserModelId\com.p51.CoinCell` class key
+    (`DisplayName`, `IconUri` → `icon.png` beside the exe) - the unpackaged-app
+    route, no shortcut `IPropertyStore` surgery. Called from `install::register()`
+    on a real install *and* from `main` at startup so loose runs are branded too;
+    `unregister()` drops the key + icon.
+  - **Linux**: `.icon("coincell")`, the themed name `install` drops under
+    `hicolor`.
 - Wired posts: `EngineEvent::Pulled` and `Conflict` (from `App::drain_sync`,
-  resolved to a game name via the catalog by `App::game_label`) and
-  `SessionExpired` (from `handle_session_expired`). `EngineEvent::Error` is left
-  unwired pending a call on which sync errors deserve a toast (`on_error` is
-  already in config + the settings UI).
+  resolved to a game name via the catalog by `App::game_label`), `SessionExpired`
+  (from `handle_session_expired`), `UpdateReady` (from `drain_updater`). A
+  **Send a test notification** button in Config › Notifications calls
+  `notice::send_test()`, which hands `Notice::Test` straight to the sink past the
+  gate + dedup. `EngineEvent::Error` is still unwired pending a call on which
+  sync errors deserve a toast (`on_error` is already in config + the UI).
 
 ## Art cache
 
@@ -747,7 +773,21 @@ given duration).
   catch-up delivers the real row. Skips if `last_uploaded_hash` already matches
   or the item is already queued. `[sync].upload_trigger = manual` → no upload,
   emit `PushPending` (a forced "Sync now" overrides). `on-emulator-exit` behaves
-  as `on-change` for now (process-watch is the launcher's job).
+  as `on-change` plus the emulator watch below (which force-pushes on exit).
+
+### Emulator watch **[BUILT]**
+
+`src/emulator_watch.rs` - a thread `SyncEngine::start` spawns alongside the
+worker (shares its `stop` `Arc`). Every 4 s it `sysinfo`-scans the process list
+for `[sync].emulators` basenames (name + exe file-stem, lowercased, extension
+stripped) and, when that running set **changes**, sends `Control::SyncNow` -
+which force-pulls (catch another device's save before the emulator loads a stale
+one) and force-pushes (so `on-emulator-exit` is real). The set is seeded from
+what's already running at startup, so an emulator open when CoinCell launches
+doesn't fire a spurious "started" sync but its exit still pushes. No ROM / launch
+command handling - which save belongs to which game already comes from the
+path↔instance mapping. Gated by `[sync].enabled && [sync].watch_emulators`;
+editable list in Config › Sync. New dep: `sysinfo` (`system` feature only).
 - **Offline queue**: on `upload_save` failure → `clear_stale_uploads(id, hash)`
   then `enqueue_upload(id, hash, bytes)`. `drain_queue()` runs on `Connected`,
   on "Sync now", and on the 60 s tick: per-item exponential backoff (`5s, 10s,
@@ -915,16 +955,30 @@ swap it) and registers it per-user, no admin.
   from `icon_128_128.png`) via `winresource` when `CARGO_CFG_TARGET_OS ==
   windows`, so Explorer / taskbar / Alt-Tab / the `.lnk` show the real icon.
   The running window's icon is set separately via `ViewportBuilder::with_icon`.
-- **Still deferred to the notification work**: an AppUserModelID *on* that
-  Start Menu shortcut (needs COM / `IPropertyStore`) so Windows toasts render
-  as "CoinCell". `register()` has a TODO marker.
+- **AppUserModelID**: `register()` writes an `HKCU\...\AppUserModelId\`
+  class key (`com.p51.CoinCell`) so Windows toasts render as "CoinCell" with our
+  icon - see Notifications. No shortcut `IPropertyStore` surgery.
 
 ## Updater
 
-**STARTED** (`src/update.rs` + `src/app` wiring). Check + download + verify +
-swap + relaunch all work, driven by a **Check for updates** button in Config ›
-Updates. Not yet wired: automatic checks on `[updates].check_interval`, and the
-`[updates].on_update` = download / install actions (the button is manual-only).
+**BUILT** (`src/update.rs` + `src/app` wiring). Manual **Check for updates** in
+Config › Updates *and* automatic background checks:
+
+- `App::tick_update_check` (every `logic()` tick, release builds only) fires an
+  auto-check when `[updates].auto_check` and `Instant::now()` is past
+  `App::next_update_check`. That instant is set by `schedule_update_check` from
+  the persisted `store` `meta` key `last_update_check` + `[updates].check_interval`
+  (a never-run / overdue check is scheduled ~45 s out, not instantly). Skipped
+  while `updater.busy()` or an offer is already surfaced.
+- `drain_updater`, when a check finishes: persists `now` to `last_update_check`,
+  re-arms the timer, and if it was an auto-check that found something, applies
+  `[updates].on_update` - `notify` (and `download`, un-implemented pre-staging)
+  → `notice::post(Notice::UpdateReady { version })` + leave it in
+  `Updater::Checked(Some)`; `install` → `start_update_install` straight away.
+- `start_update_check(auto)` carries the auto/manual distinction via
+  `App::auto_check_pending`. `Notice::UpdateReady` rides the master
+  `[notifications].enabled` only (no per-kind flag - `on_update = notify` is the
+  opt-in).
 
 **Signing (minisign).** Detached `.minisig` per release archive, verified in-app
 with the `minisign-verify` crate (pure Rust, no libsodium). Chosen over cosign:
@@ -1175,16 +1229,23 @@ None blocking. In rough build order:
    with minisign, and publish a GitHub Release. See Build & CI.
 5. Multilingual game titles - **DONE**. Server-resolved names, `jp` CJK font
    bundled, license in place, unused CJK otfs removed.
-6. **Self-install + OS autostart** - **DONE** (`src/install.rs`). Install /
-   uninstall from Config › Startup and `coincell --uninstall`; HKCU Run /
-   `~/.config/autostart` wired to the launch-on-login toggle. Left: a Windows
-   Start Menu shortcut with an AppUserModelID (belongs with notifications) and a
-   first-run install prompt.
-7. **Self-updater** - **STARTED** (`src/update.rs`). Manual "Check for updates"
-   in Config → verify (minisign + sha256) → `self-replace` → relaunch with the
-   `ipc::acquire_wait` handoff. Left: automatic checks on `check_interval`, the
-   `on_update` download / install actions.
-8. `[sync].upload_trigger` = `on-emulator-exit` / `pause_on_metered` behaviour.
-9. Launcher / process-watch model for "pull right before you play".
-10. Notification delivery backend (OS toast sink) - `notice.rs` is wired,
-    delivery is log-only. Cross-platform, deferred.
+6. **Self-install + onboarding** - **DONE** (`src/install.rs` + first-run
+   modals). Install / uninstall from Config › Startup and `coincell --uninstall`;
+   HKCU Run / `~/.config/autostart`; Windows Start Menu `.lnk`; the HKCU
+   AppUserModelID class key for branded toasts; the install → usage-data →
+   tray-explainer first-run chain; stay-visible-until-`onboarded`. Nothing left.
+7. **Self-updater** - **BUILT** (`src/update.rs` + `src/app`). Manual + automatic
+   checks (`check_interval`, persisted `last_update_check`), `on_update` =
+   notify / install applied; verify (minisign + sha256) → `self-replace` →
+   relaunch via the `ipc::acquire_wait` handoff. Left: `on_update = download`
+   pre-staging (currently == notify).
+8. **Emulator watch** - **BUILT** (`src/emulator_watch.rs`). `sysinfo` process
+   poll; start/exit of a `[sync].emulators` basename → `Control::SyncNow`. Covers
+   `on-emulator-exit` and the "pull right before you play" case without a real
+   launcher.
+9. **`pause_on_metered`** - Windows metered-connection awareness; still just a
+   config flag.
+10. **Notification delivery backend** - **BUILT** (`src/toast.rs`). `notify-rust`
+    on a worker thread; Windows toasts branded via the HKCU AppUserModelID class
+    key; Config › Notifications "Send a test notification" button. Left:
+    `EngineEvent::Error` → `Notice::Error` (which errors deserve a toast).

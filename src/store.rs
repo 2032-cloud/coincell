@@ -98,6 +98,7 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 const CURSOR_KEY: &str = "sync_cursor";
+const UPDATE_CHECK_KEY: &str = "last_update_check";
 
 /// A row of the `instances` table: one watched save file bound to a backend game
 /// instance, plus its sync bookkeeping.
@@ -416,21 +417,39 @@ impl Store {
         Ok((others == 0).then_some(hash))
     }
 
-    // ---- stream cursor ------------------------------------------------
+    // ---- meta k/v ----------------------------------------------------
+
+    /// A value from the `meta` table, or `None` if unset.
+    pub fn meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0)).optional()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 
     /// The persisted `?since=` cursor (max `last_saved_at` seen), or `None` for a
     /// full hydrate on next start.
     pub fn sync_cursor(&self) -> rusqlite::Result<Option<String>> {
-        self.conn.query_row("SELECT value FROM meta WHERE key = ?1", params![CURSOR_KEY], |r| r.get(0)).optional()
+        self.meta(CURSOR_KEY)
     }
 
     pub fn set_sync_cursor(&self, cursor: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![CURSOR_KEY, cursor],
-        )?;
-        Ok(())
+        self.set_meta(CURSOR_KEY, cursor)
+    }
+
+    /// UTC `"YYYY-MM-DD HH:MM:SS"` of the last update check, or `None`.
+    pub fn last_update_check(&self) -> rusqlite::Result<Option<String>> {
+        self.meta(UPDATE_CHECK_KEY)
+    }
+
+    pub fn set_last_update_check(&self, when: &str) -> rusqlite::Result<()> {
+        self.set_meta(UPDATE_CHECK_KEY, when)
     }
 
     // ---- offline upload queue ---------------------------------------
