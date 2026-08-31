@@ -553,6 +553,22 @@ impl ConfigApp {
         ui.small("Snapshots the engine takes before a sync would overwrite unsaved local changes. The bytes live next to the database; restoring one writes it back to disk and re-uploads it as the newest save.");
         ui.add_space(8.0);
 
+        let mut retain = Config::get(|c| c.backups.retain);
+        ui.horizontal(|ui| {
+            ui.label("Keep per game");
+            if combo(ui, "backup_retain", &mut retain, BACKUP_RETAIN) {
+                let r = Config::update(|c| c.backups.retain = retain);
+                self.note_save(r);
+                match Store::write(|s| s.prune_all_backups(retain)) {
+                    Ok(orphans) => orphans.iter().for_each(|h| {
+                        let _ = std::fs::remove_file(BACKUP_DIR.join(h));
+                    }),
+                    Err(e) => self.error = Some(format!("Couldn't prune backups: {e:#}")),
+                }
+            }
+        });
+        ui.add_space(8.0);
+
         if rows.is_empty() {
             ui.weak("No local backups.");
             return None;
@@ -791,3 +807,6 @@ const CHANNELS: &[(&str, UpdateChannel)] = &[("Stable", UpdateChannel::Stable), 
 const UPDATE_ACTIONS: &[(&str, UpdateAction)] = &[("Notify me", UpdateAction::Notify), ("Download only", UpdateAction::Download), ("Install automatically", UpdateAction::Install)];
 
 const LOG_LEVELS: &[(&str, LogLevel)] = &[("Error", LogLevel::Error), ("Warn", LogLevel::Warn), ("Info", LogLevel::Info), ("Debug", LogLevel::Debug), ("Trace", LogLevel::Trace)];
+
+/// Per-game backup retention presets; `0` = keep everything. See `[backups].retain`.
+const BACKUP_RETAIN: &[(&str, usize)] = &[("10", 10), ("25", 25), ("50", 50), ("100", 100), ("Keep everything", 0)];

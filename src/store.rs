@@ -417,6 +417,48 @@ impl Store {
         Ok((others == 0).then_some(hash))
     }
 
+    /// Trim one instance's backups to the `keep` newest, deleting the rest via
+    /// [`Self::delete_backup`]. Returns the `content_hash` of every blob the
+    /// deletions left unreferenced, for the caller to unlink. `keep == 0` keeps
+    /// everything.
+    pub fn prune_backups(&self, id: &str, keep: usize) -> rusqlite::Result<Vec<String>> {
+        if keep == 0 {
+            return Ok(Vec::new());
+        }
+        let doomed: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM save_backups WHERE game_instance_id = ?1
+                 ORDER BY overwritten_at DESC, id DESC LIMIT -1 OFFSET ?2",
+            )?;
+            stmt.query_map(params![id, keep as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        let mut orphaned = Vec::new();
+        for row_id in doomed {
+            if let Some(hash) = self.delete_backup(row_id)? {
+                orphaned.push(hash);
+            }
+        }
+        Ok(orphaned)
+    }
+
+    /// [`Self::prune_backups`] for every instance that has backups - including
+    /// orphaned ones whose game was unmapped. For applying a lowered retention
+    /// limit across the board.
+    pub fn prune_all_backups(&self, keep: usize) -> rusqlite::Result<Vec<String>> {
+        if keep == 0 {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT DISTINCT game_instance_id FROM save_backups")?;
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        let mut orphaned = Vec::new();
+        for id in ids {
+            orphaned.extend(self.prune_backups(&id, keep)?);
+        }
+        Ok(orphaned)
+    }
+
     // ---- meta k/v ----------------------------------------------------
 
     /// A value from the `meta` table, or `None` if unset.
@@ -810,6 +852,73 @@ mod tests {
         // deleting a row that's already gone is a no-op
         assert_eq!(store.delete_backup(ids[0]).unwrap(), None);
         assert!(store.backups_for("i").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_backups_keeps_the_newest_and_frees_orphaned_blobs() {
+        let store = mem();
+        store.bind_instance("i", Path::new("/saves/g.srm"), None).unwrap();
+        for n in 0..5 {
+            // distinct overwritten_at so the ORDER BY is deterministic
+            store
+                .conn
+                .execute(
+                    "INSERT INTO save_backups (game_instance_id, original_path, content_hash, size_bytes, replaced_with, reason, overwritten_at)
+                     VALUES ('i', '/saves/g.srm', ?1, 8, 'srv', 'pull', ?2)",
+                    params![format!("h{n}"), format!("2026-08-30 12:0{n}:00")],
+                )
+                .unwrap();
+        }
+        // keep the 2 newest (h4, h3); h0..=h2 go, each a unique blob
+        let mut orphaned = store.prune_backups("i", 2).unwrap();
+        orphaned.sort();
+        assert_eq!(orphaned, ["h0", "h1", "h2"]);
+        let left: Vec<_> = store.backups_for("i").unwrap().into_iter().map(|b| b.content_hash).collect();
+        assert_eq!(left, ["h4", "h3"]);
+        // idempotent, and keep == 0 is a no-op
+        assert!(store.prune_backups("i", 2).unwrap().is_empty());
+        assert!(store.prune_backups("i", 0).unwrap().is_empty());
+        assert_eq!(store.backups_for("i").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_backups_frees_a_shared_blob_only_once_its_last_row_goes() {
+        let store = mem();
+        store.bind_instance("i", Path::new("/p"), None).unwrap();
+        // insert order == id order; same-second timestamps so `id DESC` decides.
+        // Two rows over "shared", then a unique "keeper" as the newest.
+        store.insert_backup("i", Path::new("/p"), "shared", 8, "s", None, "pull").unwrap();
+        store.insert_backup("i", Path::new("/p"), "shared", 8, "s", None, "conflict").unwrap();
+        store.insert_backup("i", Path::new("/p"), "keeper", 8, "s", None, "pull").unwrap();
+
+        // keep 1 -> "keeper" stays, both "shared" rows go; the blob is reported
+        // exactly once, on the deletion that removed its last reference.
+        let orphaned = store.prune_backups("i", 1).unwrap();
+        assert_eq!(orphaned, ["shared"]);
+        let left: Vec<_> = store.backups_for("i").unwrap().into_iter().map(|b| b.content_hash).collect();
+        assert_eq!(left, ["keeper"]);
+    }
+
+    #[test]
+    fn prune_all_backups_covers_orphaned_instances() {
+        let store = mem();
+        for inst in ["a", "b"] {
+            for n in 0..4 {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO save_backups (game_instance_id, original_path, content_hash, size_bytes, replaced_with, reason, overwritten_at)
+                         VALUES (?1, '/p', ?2, 8, 'srv', 'pull', ?3)",
+                        params![inst, format!("{inst}{n}"), format!("2026-08-30 12:0{n}:00")],
+                    )
+                    .unwrap();
+            }
+        }
+        // no instances bound at all - these are orphaned backups
+        let orphaned = store.prune_all_backups(2).unwrap();
+        assert_eq!(orphaned.len(), 4); // 2 dropped per instance
+        assert_eq!(store.backups_for("a").unwrap().len(), 2);
+        assert_eq!(store.backups_for("b").unwrap().len(), 2);
     }
 
     #[test]

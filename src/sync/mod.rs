@@ -581,10 +581,23 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
             self.emit(EngineEvent::Error(format!("backup {}: {e}", book.save_path.display())));
             return Guard::Aborted;
         }
-        let record = Store::write(|s| s.insert_backup(&book.game_instance_id, &book.save_path, &hash, bytes.len() as u64, incoming_hash, server_save_id, reason));
-        if let Err(e) = record {
-            self.emit(EngineEvent::Error(format!("backup record: {e:#}")));
-            return Guard::Aborted;
+        // Record it, then trim this game's history to `[backups].retain` in the
+        // same transaction so a crash can't leave the index over-long.
+        let keep = Config::get(|c| c.backups.retain);
+        let recorded = Store::write(|s| {
+            s.insert_backup(&book.game_instance_id, &book.save_path, &hash, bytes.len() as u64, incoming_hash, server_save_id, reason)?;
+            s.prune_backups(&book.game_instance_id, keep)
+        });
+        match recorded {
+            Ok(orphans) => {
+                for h in orphans {
+                    let _ = fs::remove_file(BACKUP_DIR.join(&h));
+                }
+            }
+            Err(e) => {
+                self.emit(EngineEvent::Error(format!("backup record: {e:#}")));
+                return Guard::Aborted;
+            }
         }
         tracing::info!("kept a backup of {} before overwrite ({reason})", book.save_path.display());
         Guard::Proceed

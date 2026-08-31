@@ -321,6 +321,21 @@ impl Default for Updates {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct BackupSettings {
+    /// How many pre-overwrite snapshots to keep per game. As new ones are taken
+    /// the oldest beyond this are pruned, blobs and all. `0` keeps every backup
+    /// forever. The files are tiny, so the default is generous.
+    pub retain: usize,
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self { retain: 25 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Advanced {
     /// Base URL for the device API. Override for local dev / self-host.
     pub api_base: Arc<str>,
@@ -356,6 +371,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub window: WindowRules,
     pub updates: Updates,
+    pub backups: BackupSettings,
     pub advanced: Advanced,
 }
 

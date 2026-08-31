@@ -193,7 +193,6 @@ enabled = true                # global pause switch
 poll = "auto"                 # "auto" | "30s" | "5m" | "off"
 upload_trigger = "on-change"  # "on-change" (debounced) | "on-emulator-exit" | "manual"
 conflict = "ask"              # "ask" | "prefer-local" | "prefer-remote" | "prefer-newest"
-pause_on_metered = true       # Windows metered-connection awareness
 watch_emulators = true        # nudge sync when a watched emulator starts / exits
 emulators = ["retroarch", …] # executable basenames (no ext); a broad default set
 
@@ -216,6 +215,9 @@ channel = "stable"            # "stable" | "prerelease"
 auto_check = true
 check_interval = "24h"
 on_update = "notify"          # "notify" | "download" | "install"
+
+[backups]
+retain = 25                   # pre-overwrite snapshots kept per game; 0 = keep all
 
 [advanced]
 api_base = "https://cr.2032.cloud"   # override for dev / self-host
@@ -260,10 +262,11 @@ Rail sections:
    can't do (rename/revoke other sessions, theme, retention, deletion). Sign-out
    is the rail's footer button, not here. _(No `sub` shown yet - would need a
    `GET /api/me` fetch the app doesn't do outside validation.)_
-2. **Sync** - `enabled`, poll interval, upload trigger, conflict policy,
-   pause-on-metered, and a **Sync now** button (`ConfigOutcome::SyncNow` →
-   `SyncEngine::sync_now`), disabled when `enabled` is off. _(No live status line
-   yet - the engine emits `EngineEvent::Status` but Home isn't built to show it.)_
+2. **Sync** - `enabled`, poll interval, upload trigger, conflict policy, the
+   emulator-watch toggle + list, and a **Sync now** button
+   (`ConfigOutcome::SyncNow` → `SyncEngine::sync_now`), disabled when `enabled` is
+   off. _(No live status line yet - the engine emits `EngineEvent::Status` but
+   Home isn't built to show it.)_
 3. **Startup** - an **install / uninstall** block (see Install), launch on
    login, start hidden, and (a stray `[window]` toggle that fits here better
    than its own section) **hide the window when it loses focus** =
@@ -275,8 +278,9 @@ Rail sections:
    now calls `install::set_autostart` (HKCU Run value / `~/.config/autostart`
    `.desktop`); it only bites once CoinCell is installed.
 4. **Notifications** - master toggle + the four per-event toggles (disabled while
-   the master is off). These gate `notice::post` (see Notifications); delivery
-   itself is still log-only.
+   the master is off) + a **Send a test notification** button. These gate
+   `notice::post`; delivery is real OS toasts via `src/toast.rs` (see
+   Notifications).
 5. **Appearance** - theme (follow account / follow system / light / dark;
    applied live via `src/theme.rs`, see Theme) and **UI scale**
    (`window.ui_scale`, a preset % combo). Scale is applied live too: `App::logic`
@@ -290,18 +294,20 @@ Rail sections:
    checks on `[updates].check_interval` run too; `[updates].on_update` = `notify`
    posts a `Notice`, `download` pre-fetches + verifies the binary then posts the
    `Notice`, `install` auto-applies.
-7. **Save backups** - every pre-overwrite local snapshot the engine has kept
-   (`Store::backups()`), newest first, labelled by game (name resolved from the
-   catalog, else the raw instance id + original path for a deleted game). This is
-   the catch-all and the only place backups for an unmapped / deleted game are
-   reachable; per-game history with the server saves alongside lives on the
-   game's page in Home. Each row: size, relative age, `reason` gloss, **Open
-   folder**, **Delete** (inline confirm), and **Restore** - enabled only when the
-   instance is currently mapped (`ConfigOutcome::RestoreBackup` →
-   `SyncEngine::restore`), disabled with a hint otherwise. Delete drops the index
-   row and, if nothing else references the content-addressed blob
-   (`Store::delete_backup` returns the now-orphaned hash), its file. Rail icon is
-   `icons::RESTORE` (Phosphor clock-counter-clockwise).
+7. **Save backups** - a **Keep per game** retention combo (`[backups].retain`,
+   presets 10 / 25 / 50 / 100 / keep-all; lowering it runs
+   `Store::prune_all_backups` immediately, unlinking freed blobs), then every
+   pre-overwrite local snapshot the engine has kept (`Store::backups()`), newest
+   first, labelled by game (name resolved from the catalog, else the raw instance
+   id + original path for a deleted game). This is the catch-all and the only
+   place backups for an unmapped / deleted game are reachable; per-game history
+   with the server saves alongside lives on the game's page in Home. Each row:
+   size, relative age, `reason` gloss, **Open folder**, **Delete** (inline
+   confirm), and **Restore** - enabled only when the instance is currently mapped
+   (`ConfigOutcome::RestoreBackup` → `SyncEngine::restore`), disabled with a hint
+   otherwise. Delete drops the index row and, if nothing else references the
+   content-addressed blob (`Store::delete_backup` returns the now-orphaned hash),
+   its file. Rail icon is `icons::RESTORE` (Phosphor clock-counter-clockwise).
 8. **Advanced** - log level (both it and the crash-reports toggle note "applies
    on restart"), crash-reports checkbox (shows "not answered yet" when the pref
    is absent), API base URL (commits on focus-loss, blank reverts),
@@ -723,8 +729,11 @@ map-time "use the server's copy" path seeds it to the local hash for bytes that
 were never sent. `save_backups` has **no FK / cascade** to `instances` - a backup
 outlives an unmap. Restore of a snapshot is via the history UI / Config › Save
 backups (see those); `Store::delete_backup` there prunes a row and its blob when
-nothing else references it. Still not built: automatic pruning (the dir grows
-unbounded without a manual delete; saves are tiny).
+nothing else references it. **Automatic pruning**: after each new snapshot,
+`guard_overwrite` runs `Store::prune_backups(instance, [backups].retain)` in the
+same transaction (default 25 per game, `0` = keep all) and unlinks any blob the
+deletions left unreferenced. Config › Save backups exposes the limit and a
+`prune_all_backups` sweep when it's lowered.
 
 ### Event handling
 
@@ -832,9 +841,11 @@ last-synced hash **and** the two differ (the `else` row of the table above).
 - `Unauthorized` mid-sync flips the app to logged-out and fires the
   session-expired notification - see Event handling. **[BUILT]**
 - `[sync].enabled = false` drops the whole engine (`App` sets `self.sync = None`).
-  A finer `pause_on_metered` (Windows) / per-instance pause that keeps the
-  watcher running but suspends network work is **[TODO]** (`InstanceRecord.paused`
-  is already honoured by `rescan` / `hydrate`, just has no UI).
+  A per-instance pause that keeps the watcher running but suspends network work
+  exists in the store (`InstanceRecord.paused`, honoured by `rescan` / `hydrate`)
+  and has a checkbox on the detail page. **`pause_on_metered` was dropped**: this
+  app moves a few KB per save, so metered-connection awareness isn't worth the
+  Windows-only plumbing.
 
 ## Versioning
 
@@ -1239,8 +1250,8 @@ None blocking. In rough build order:
 
 1. **Sync engine** (`src/sync/`) - BUILT: both directions, the debounced
    filesystem watcher, the offline upload queue, conflict resolution,
-   `Unauthorized` handling, save-history restore. Left: a finer pause than
-   "drop the whole engine" (`pause_on_metered` / metered-connection awareness).
+   `Unauthorized` handling, save-history restore, per-game backup retention.
+   Nothing left. (`pause_on_metered` was dropped - see Offline / resilience.)
 2. **Home window** (`src/app/home.rs`) - BUILT: the game list + local fuzzy
    search + mapped/unmapped split + box art, the add-game flow, the instance
    detail page (map an existing save, pause, unmap, sync-now, conflict picker),
@@ -1269,8 +1280,10 @@ None blocking. In rough build order:
    poll; start/exit of a `[sync].emulators` basename → `Control::SyncNow`. Covers
    `on-emulator-exit` and the "pull right before you play" case without a real
    launcher.
-9. **`pause_on_metered`** - Windows metered-connection awareness; still just a
-   config flag.
+9. **Backup retention** - **DONE**. `[backups].retain` (default 25, `0` = keep
+   all); `Store::prune_backups` after each snapshot, `prune_all_backups` when the
+   limit drops; Config › Save backups combo. (`pause_on_metered` was **dropped** -
+   bandwidth is negligible, see Offline / resilience.)
 10. **Notification delivery backend** - **BUILT** (`src/toast.rs`). `notify-rust`
     on a worker thread; Windows toasts branded via the HKCU AppUserModelID class
     key; Config › Notifications "Send a test notification" button. Left:
