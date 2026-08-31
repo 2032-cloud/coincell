@@ -49,11 +49,11 @@ against - click routing instead).
   download raw bytes
 - `GET /api/events` - WebSocket upgrade (sessionBearer); the realtime
   save-updated stream, one per-user Durable Object behind it (see Download
-  direction). Message: `{"type":"save","instance_id":…}`, ideally with an inlined
-  `"save":{id,content_hash,size_bytes,uploaded_at,starred,note}` so the client
-  acts without a follow-up poll. The DO relays to every socket including the
-  uploader's (harmless echo → `MarkSynced`), so a client can also use it to
-  confirm its own upload made it through.
+  direction). Message: `{"type":"save","instance_id":…,"save":{id,content_hash,
+  size_bytes,uploaded_at,starred,note}}` - the `save` object is inlined (backend
+  done), so the client acts without a follow-up poll. The DO relays to every
+  socket including the uploader's (harmless echo → `MarkSynced`), so a client can
+  also use it to confirm its own upload made it through.
 - `GET /api/consoles`, `GET /api/consoles/:slug/games` - public catalog + art.
   Consoles carry `validSaveSizes: number[]`, the only save-size check we need. A
   game's `name` is already resolved for the account's `preferred_region`
@@ -547,11 +547,14 @@ posts to; `App::logic` calls `notice::pump()` once a frame to drain it to a
     `hicolor`.
 - Wired posts: `EngineEvent::Pulled` and `Conflict` (from `App::drain_sync`,
   resolved to a game name via the catalog by `App::game_label`), `SessionExpired`
-  (from `handle_session_expired`), `UpdateReady` (from `drain_updater`). A
+  (from `handle_session_expired`), `UpdateReady` (from `drain_updater`), and
+  `Notice::Error` from `EngineEvent::Stuck` - a *specific* wedged instance (a
+  held-back pull because the local save couldn't be snapshotted, or a queued
+  upload that's failed `STUCK_AFTER_ATTEMPTS` times). Plain `EngineEvent::Error`
+  (transient store / network blips, stream reconnects) stays log-only. A
   **Send a test notification** button in Config › Notifications calls
   `notice::send_test()`, which hands `Notice::Test` straight to the sink past the
-  gate + dedup. `EngineEvent::Error` is still unwired pending a call on which
-  sync errors deserve a toast (`on_error` is already in config + the UI).
+  gate + dedup.
 
 ## Art cache
 
@@ -622,7 +625,8 @@ worker thread owns both, drains the `SyncEvent`s and the debounced filesystem
 events, and does all the I/O. It talks to `App` over two channels: an
 `EngineEvent` mpsc out (`Hydrated { instances }` / `SaveAdvanced` for Home's
 catalog, plus `Status` / `Pulled` / `Pushed` / `Restored` / `PushPending` /
-`Conflict` / `Error` / `SessionExpired`), a `Control` mpsc in (`SyncNow`, which
+`Conflict` / `Error` / `Stuck { instance_id, reason }` / `SessionExpired`), a
+`Control` mpsc in (`SyncNow`, which
 polls **and** force-pushes + drains the queue; `Rehydrate` for Home's refresh
 button; `Recheck { instance_id }` after Home binds / pauses / unmaps;
 `ResolveConflict { instance_id, keep_local }` from the detail page;
@@ -745,7 +749,10 @@ deletions left unreferenced. Config › Save backups exposes the limit and a
 - `Connected` / `Disconnected { reason }` - `EngineEvent::Status` for a Home
   status line.
 - `Error { message }` - `EngineEvent::Error`, logged; non-fatal, the stream keeps
-  running.
+  running. A pull the overwrite guard had to abort, or a queued upload that's
+  failed `STUCK_AFTER_ATTEMPTS` (3) times, instead emits `EngineEvent::Stuck
+  { instance_id, reason }` - `App::drain_sync` turns that into a per-game
+  `Notice::Error` toast (gated by `[notifications].on_error`).
 - `Unauthorized` - `EngineEvent::SessionExpired`. `App` clears the session, drops
   the engine, returns to sign-in, and fires the session-expired notification.
   (This is a new `SyncEvent` variant - `SyncStream` previously folded `401` into
@@ -1286,5 +1293,6 @@ None blocking. In rough build order:
    bandwidth is negligible, see Offline / resilience.)
 10. **Notification delivery backend** - **BUILT** (`src/toast.rs`). `notify-rust`
     on a worker thread; Windows toasts branded via the HKCU AppUserModelID class
-    key; Config › Notifications "Send a test notification" button. Left:
-    `EngineEvent::Error` → `Notice::Error` (which errors deserve a toast).
+    key; Config › Notifications "Send a test notification" button. All notice
+    kinds wired, including `Notice::Error` off `EngineEvent::Stuck` (held-back
+    pull / repeatedly-failing upload). Nothing left.

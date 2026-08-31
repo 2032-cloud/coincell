@@ -40,6 +40,10 @@ const WATCH_DEBOUNCE: Duration = Duration::from_secs(3);
 /// Belt-and-braces rescan + queue-drain cadence (catches missed fs events).
 const IDLE_RESCAN: Duration = Duration::from_secs(60);
 
+/// A queued upload that has failed this many times running is "stuck", not just
+/// briefly offline - worth a one-time `EngineEvent::Stuck`.
+const STUCK_AFTER_ATTEMPTS: u32 = 3;
+
 /// Stream connectivity, for a Home status line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -85,10 +89,27 @@ pub enum EngineEvent {
     Conflict {
         instance_id: String,
     },
-    /// Non-fatal; the stream keeps running.
+    /// One instance's sync is wedged and won't recover on its own: an incoming
+    /// update was held back because the local save couldn't be snapshotted
+    /// first, or an upload has failed on repeat. Toast-worthy, unlike [`Self::Error`].
+    Stuck {
+        instance_id: String,
+        reason: StuckReason,
+    },
+    /// Non-fatal; the stream keeps running. Logged only.
     Error(String),
     /// The session is dead (`401`/`403` mid-sync). `App` must sign out + notify.
     SessionExpired,
+}
+
+/// Why an instance is [`EngineEvent::Stuck`]. `App` turns this into the toast copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckReason {
+    /// A pull was skipped: the current local save couldn't be backed up, so
+    /// overwriting it would risk unsaved bytes.
+    BackupFailed,
+    /// A queued upload has failed several times in a row and is still retrying.
+    UploadRetrying,
 }
 
 pub enum Control {
@@ -568,18 +589,14 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
             Ok(Some(bytes)) if !bytes.is_empty() => bytes,
             Ok(_) => return Guard::Proceed, // nothing on disk to keep
             Err(e) if disk::is_locked(&e) => return Guard::Deferred,
-            Err(e) => {
-                self.emit(EngineEvent::Error(format!("backup read {}: {e}", book.save_path.display())));
-                return Guard::Aborted;
-            }
+            Err(e) => return self.backup_stuck(book, format!("read {}: {e}", book.save_path.display())),
         };
         let hash = sha256_hex(&bytes);
         if !needs_backup(&hash, incoming_hash, book.last_uploaded_hash.as_deref()) {
             return Guard::Proceed;
         }
         if let Err(e) = write_backup_blob(&BACKUP_DIR, &hash, &bytes) {
-            self.emit(EngineEvent::Error(format!("backup {}: {e}", book.save_path.display())));
-            return Guard::Aborted;
+            return self.backup_stuck(book, format!("write blob for {}: {e}", book.save_path.display()));
         }
         // Record it, then trim this game's history to `[backups].retain` in the
         // same transaction so a crash can't leave the index over-long.
@@ -594,13 +611,19 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
                     let _ = fs::remove_file(BACKUP_DIR.join(&h));
                 }
             }
-            Err(e) => {
-                self.emit(EngineEvent::Error(format!("backup record: {e:#}")));
-                return Guard::Aborted;
-            }
+            Err(e) => return self.backup_stuck(book, format!("record: {e:#}")),
         }
         tracing::info!("kept a backup of {} before overwrite ({reason})", book.save_path.display());
         Guard::Proceed
+    }
+
+    /// The overwrite guard couldn't snapshot the local save, so a pull is being
+    /// skipped rather than risk unsaved bytes. Log the cause, tell `App` this
+    /// instance is stuck, and hand back [`Guard::Aborted`].
+    fn backup_stuck(&self, book: &InstanceRecord, detail: String) -> Guard {
+        tracing::warn!("backup {}: {detail}", book.game_instance_id);
+        self.emit(EngineEvent::Stuck { instance_id: book.game_instance_id.clone(), reason: StuckReason::BackupFailed });
+        Guard::Aborted
     }
 
     /// Local file is ahead of the server. Upload it (unless `manual` and not
@@ -678,7 +701,15 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
                     self.emit(EngineEvent::Pushed { instance_id: item.game_instance_id });
                 }
                 Err(e) if e.is_unauthorized() => return self.emit(EngineEvent::SessionExpired),
-                Err(e) => self.store_write(Store::write(|s| s.record_upload_failure(item.id, &e.to_string()))),
+                Err(e) => {
+                    let attempts = item.attempts + 1;
+                    tracing::warn!("queued upload for {} failed (attempt {attempts}): {e}", item.game_instance_id);
+                    self.store_write(Store::write(|s| s.record_upload_failure(item.id, &e.to_string())));
+                    // Once, when it first crosses the line into "not just a blip".
+                    if attempts == STUCK_AFTER_ATTEMPTS {
+                        self.emit(EngineEvent::Stuck { instance_id: item.game_instance_id.clone(), reason: StuckReason::UploadRetrying });
+                    }
+                }
             }
         }
     }

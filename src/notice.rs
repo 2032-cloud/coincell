@@ -28,9 +28,9 @@ pub enum Notice {
     Pulled { game: String },
     /// A save diverged on both sides; the user has to pick.
     Conflict { game: String },
-    /// A non fatal sync error worth surfacing. Not posted yet: see the
-    /// `TODO(notice)` in `App::drain_sync`.
-    #[allow(dead_code)]
+    /// One instance's sync is wedged (a held-back pull, or an upload that keeps
+    /// failing). Posted from `App::drain_sync` on `EngineEvent::Stuck`; `detail`
+    /// is the full user-facing sentence, game name included.
     Error { detail: String },
     /// The session died mid sync and the app signed out.
     SessionExpired,

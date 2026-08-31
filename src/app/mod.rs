@@ -19,7 +19,7 @@ use crate::config::{Config, UpdateAction, UpdateChannel};
 use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
 use crate::store::Store;
-use crate::sync::{EngineEvent, RestoreSource, SyncEngine};
+use crate::sync::{EngineEvent, RestoreSource, StuckReason, SyncEngine};
 use crate::theme::{self, Scheme};
 use crate::update::{self, Available, StagedUpdate};
 
@@ -278,8 +278,20 @@ impl App {
                     tracing::warn!("{instance_id}: conflict, resolve in Home");
                     notice::post(Notice::Conflict { game: self.game_label(&instance_id) });
                 }
-                // TODO(notice): decide which sync errors are toast-worthy before wiring `Notice::Error` ([notifications].on_error already exists).
+                // Transient/internal errors stay in the log; only a wedged
+                // instance (`Stuck`) is worth interrupting the user for.
                 EngineEvent::Error(message) => tracing::warn!("sync: {message}"),
+                EngineEvent::Stuck { instance_id, reason } => {
+                    let game = self.game_label(&instance_id);
+                    let detail = match reason {
+                        StuckReason::BackupFailed => {
+                            format!("{game}: an update from another device is on hold. CoinCell couldn't back up your local save first - check the file isn't open in an emulator.")
+                        }
+                        StuckReason::UploadRetrying => format!("{game}: the latest save isn't uploading yet. CoinCell will keep retrying."),
+                    };
+                    tracing::warn!("sync stuck [{instance_id}]: {detail}");
+                    notice::post(Notice::Error { detail });
+                }
                 EngineEvent::SessionExpired => session_expired = true,
             }
         }
