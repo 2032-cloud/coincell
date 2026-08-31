@@ -79,8 +79,9 @@ fn main() -> anyhow::Result<()> {
     // Start hidden to the tray? `App` starts in its Hidden state and
     // `reconcile_visibility` hides the OS window on the first frames. (eframe
     // ignores `ViewportBuilder::with_visible` and force-shows after the first
-    // paint, so the builder flag below is only a hint.)
-    let start_hidden = config::Config::get(|c| c.startup.start_hidden);
+    // paint, so the builder flag below is only a hint.) A first run that hasn't
+    // been through the onboarding flow always shows, regardless of the pref.
+    let start_hidden = config::Config::get(|c| c.startup.start_hidden && c.startup.onboarded);
 
     eframe::run_native(
         &format!("CoinCell - {}", branding.identity.name),

@@ -177,6 +177,8 @@ session_id = "..."
 launch_on_login = false       # OS autostart: Run key / .desktop / LaunchAgent
 start_hidden = true
 skip_install_prompt = false   # set by "Not now" on the first-run install prompt
+onboarded = false             # first-run flow done (incl. the tray explainer);
+                              # until true the window starts visible + never auto-hides
 
 [sync]
 enabled = true                # global pause switch
@@ -991,9 +993,10 @@ for `install.rs`).
   `version::VERSION`, `environment` = `version::CHANNEL` (see Versioning).
   Toggling crash reports needs a restart.
 - **The opt-in gate IS built.** `[advanced].crash_reports` is tri-state:
-  **absent** until answered. On the first `Ready`, if it's absent, `App` shows a
-  one-time `egui::Modal` ("upload anonymous error reports?") and writes the
-  answer; backdrop / `Esc` counts as no. Not re-asked on later sign-ins - a fresh
+  **absent** until answered. It's the middle step of the first-run modal chain
+  (install → this → tray explainer; see Window behavior): a one-time
+  `egui::Modal` ("upload anonymous error reports?") whose answer is written;
+  backdrop / `Esc` counts as no. Not re-asked on later sign-ins - a fresh
   `config.toml` (or a future "Reset config") brings it back. Also a plain
   checkbox in Config > Advanced. Reports would ship stack traces and local paths,
   hence opt-in.
@@ -1002,11 +1005,21 @@ for `install.rs`).
 
 **BUILT** (`app/mod.rs`).
 
-- egui's own popups (combo boxes, the first-run modal, in-window confirms) keep
+- egui's own popups (combo boxes, the first-run modals, in-window confirms) keep
   focus inside the window, so auto-hide was never a real threat to the settings
   UI. A native window we don't own **would** hand focus away, so auto-hide and
   the Esc-minimise are gated by `modal_active` = `busy_auth` (the device flow /
-  session check) **or** `pending_pick.is_some()` (the save-file picker, below).
+  session check), `pending_pick.is_some()` (the save-file picker, below), or any
+  of the three first-run modals (`ask_install` / `ask_crash_reports` /
+  `ask_tray_intro`).
+- **First-run flow** (all one-time, after the first `Ready`, in order): the
+  install prompt (see Install), the usage-data prompt (see Logging), then a
+  **"CoinCell runs in the tray"** explainer. `App::advance_first_run_prompts`
+  sets the next pending flag; each modal's resolve calls it again. Until
+  `[startup].onboarded` (set by the explainer's "Got it"), the window **starts
+  visible regardless of `start_hidden`** (`main` ANDs the two) and **never
+  auto-hides** (the focus-loss check also requires `onboarded`). Existing
+  installs hit the explainer once on the first launch after upgrading.
 - The **save-file picker runs off the UI thread**: Home returns
   `HomeOutcome::OpenSaveDialog`, `App` spawns a thread that calls
   `mapping::pick_save_file` (RFD inits COM per call, so any thread is fine),
@@ -1023,8 +1036,8 @@ for `install.rs`).
   ignores `ViewportBuilder::with_visible`, re-asserting is the only reliable way
   to honour `start_hidden`. The hidden branch of `ui()` still paints an empty
   `CentralPanel` so a briefly-shown window is themed-blank, never black.
-- `App` starts in `WindowState::Hidden` when `[startup].start_hidden`, else
-  `ShowConfig`.
+- `App` starts in `WindowState::Hidden` when `[startup].start_hidden`
+  **and** `[startup].onboarded`, else `ShowConfig`.
 - The shared title bar (`App::header`, a `Panel::top` above every screen) carries
   the screen name and the **—** minimise button. The button always works.
 - **Esc** also minimises - consumed at end-of-frame via `input_mut().consume_key`

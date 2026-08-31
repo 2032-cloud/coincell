@@ -749,11 +749,8 @@ impl HomeApp {
                             save.size_bytes,
                             save.uploaded_at.as_str(),
                             |ui| {
-                                let (glyph, color, hover) = if save.starred {
-                                    ("\u{2605}", GOLD, "Starred \u{2014} kept regardless of the retention limit")
-                                } else {
-                                    ("\u{2606}", ui.visuals().weak_text_color(), "Not starred")
-                                };
+                                let (glyph, color, hover) =
+                                    if save.starred { ("\u{2605}", GOLD, "Starred, kept regardless of the retention limit") } else { ("\u{2606}", ui.visuals().weak_text_color(), "Not starred") };
                                 ui.label(egui::RichText::new(glyph).size(15.0).color(color)).on_hover_text(hover);
                             },
                             |ui| {

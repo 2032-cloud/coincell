@@ -15,3 +15,4 @@ pub const SIGN_OUT: &str = "\u{E42A}";
 pub const POWER: &str = "\u{E3DA}";
 pub const WARNING: &str = "\u{E4E0}";
 pub const RESTORE: &str = "\u{E1A0}";
+pub const MINIMISE: &str = "\u{E09A}";

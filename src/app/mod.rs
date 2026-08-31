@@ -14,6 +14,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, GameInstance, SessionCheck, SessionStatus};
 use crate::app::config::{ConfigApp, ConfigOutcome};
 use crate::app::home::{HomeApp, HomeOutcome, HomeView};
+use crate::app::icons::MINIMISE;
 use crate::config::Config;
 use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
@@ -117,6 +118,9 @@ pub struct App {
     /// Set on first Ready when running a loose release build that isn't
     /// installed; drives the one-time "install CoinCell?" prompt.
     ask_install: bool,
+    /// Set on first Ready until `[startup].onboarded`; drives the one-time
+    /// "CoinCell lives in the tray" explainer (shown after usage data).
+    ask_tray_intro: bool,
     wake_rx: Receiver<()>,
     auth: AuthView,
     device_config: DeviceConfig,
@@ -175,6 +179,7 @@ impl App {
             quitting: false,
             ask_crash_reports: false,
             ask_install: false,
+            ask_tray_intro: false,
             wake_rx,
             auth,
             device_config,
@@ -383,6 +388,7 @@ impl App {
         self.focus_latch = true;
         self.ask_crash_reports = false;
         self.ask_install = false;
+        self.ask_tray_intro = false;
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -409,6 +415,22 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Pick the next pending first-run modal, in order: install → usage data →
+    /// tray explainer. Called on first `Ready` and after each one resolves; when
+    /// nothing is pending all three flags stay `false`.
+    fn advance_first_run_prompts(&mut self) {
+        self.ask_install = false;
+        self.ask_crash_reports = false;
+        self.ask_tray_intro = false;
+        if crate::install::needs_first_run_prompt() {
+            self.ask_install = true;
+        } else if !Config::get(|c| c.crash_reports_answered()) {
+            self.ask_crash_reports = true;
+        } else if !Config::get(|c| c.startup.onboarded) {
+            self.ask_tray_intro = true;
+        }
+    }
+
     /// One-time modal shown right after the first sign-in when the crash-report
     /// preference has never been set. Either choice is recorded; a backdrop /
     /// Esc dismiss counts as "no".
@@ -433,7 +455,31 @@ impl App {
 
         if let Some(enabled) = resp.inner.or_else(|| resp.should_close().then_some(false)) {
             let _ = Config::update(|c| c.set_crash_reports(enabled));
-            self.ask_crash_reports = false;
+            self.advance_first_run_prompts();
+        }
+    }
+
+    /// One-time modal after the usage-data prompt: explain that CoinCell lives
+    /// in the tray so a fresh install that starts hidden isn't a mystery. "Got
+    /// it" sets `[startup].onboarded`, which also re-enables `start_hidden` and
+    /// focus-loss auto-hide from here on.
+    fn tray_intro_prompt(&mut self, ctx: &egui::Context) {
+        let resp = egui::Modal::new(egui::Id::new("first_run_tray_intro")).show(ctx, |ui| {
+            ui.set_max_width(280.0);
+            ui.heading("CoinCell runs in the tray");
+            ui.add_space(6.0);
+            ui.label("Closing this window doesn't quit CoinCell, it keeps syncing from the system tray.");
+            ui.add_space(6.0);
+            ui.label("\u{2022}  Left-click the tray icon for your games");
+            ui.label("\u{2022}  Right-click it for settings");
+            ui.label("\u{2022}  The close button (top right) or Esc sends this window back to the tray");
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| ui.button("Got it").clicked()).inner
+        });
+
+        if resp.inner || resp.should_close() {
+            let _ = Config::update(|c| c.startup.onboarded = true);
+            self.advance_first_run_prompts();
         }
     }
 
@@ -467,20 +513,16 @@ impl App {
         let Some(install) = resp.inner.or_else(|| resp.should_close().then_some(false)) else {
             return;
         };
-        self.ask_install = false;
         if install {
             match crate::install::install() {
                 Ok(path) => return self.relaunch_from(ctx, path),
                 Err(e) => tracing::error!("first-run install failed: {e:#}"),
             }
-        } else {
-            let _ = Config::update(|c| c.startup.skip_install_prompt = true);
         }
-        // Didn't install (declined, or it failed): fall through to the
-        // crash-reports prompt this same session.
-        if !Config::get(|c| c.crash_reports_answered()) {
-            self.ask_crash_reports = true;
-        }
+        // Declined, dismissed, or it failed: don't nag again (the Config button
+        // stays), and move on to the next first-run prompt.
+        let _ = Config::update(|c| c.startup.skip_install_prompt = true);
+        self.advance_first_run_prompts();
     }
 
     /// A self-install / update-in-place wrote the binary at `path`; spawn it
@@ -539,7 +581,7 @@ impl App {
             ui.horizontal_centered(|ui| {
                 ui.label(egui::RichText::new(title).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    minimise = ui.button(egui::RichText::new("—").size(14.0)).on_hover_text("Minimise to tray (Esc)").clicked();
+                    minimise = ui.button(egui::RichText::new(MINIMISE).size(14.0)).on_hover_text("Minimise to tray (Esc)").clicked();
                 });
             });
         });
@@ -613,11 +655,7 @@ impl App {
             Next::Ready => {
                 self.auth = AuthView::Ready;
                 self.focus_latch = true;
-                if crate::install::needs_first_run_prompt() {
-                    self.ask_install = true;
-                } else if !Config::get(|c| c.crash_reports_answered()) {
-                    self.ask_crash_reports = true;
-                }
+                self.advance_first_run_prompts();
                 self.start_sync(ctx);
             }
             Next::Revalidate => match api_client() {
@@ -774,10 +812,9 @@ impl eframe::App for App {
         }
 
         let busy_auth = matches!(self.auth, AuthView::Connecting { .. } | AuthView::Validating { .. });
-        // Anything that hands focus to a native window we don't own: the device
-        // flow / session check, and the off-thread save-file picker. Losing focus
-        // to one of those must not minimise us.
-        let modal_active = busy_auth || self.pending_pick.is_some();
+        // Anything that hands focus to a native window we don't own, plus the
+        // first-run modals: losing focus to one of those must not minimise us.
+        let modal_active = busy_auth || self.pending_pick.is_some() || self.ask_install || self.ask_crash_reports || self.ask_tray_intro;
 
         let lost_focus = ui.input(|i| {
             if i.focused {
@@ -787,7 +824,9 @@ impl eframe::App for App {
                 !self.focus_latch
             }
         });
-        if lost_focus && !self.quitting && !self.ask_crash_reports && !self.ask_install && !modal_active && Config::get(|c| c.window.hide_on_focus_loss) {
+        // Never auto-hide before onboarding (even if the user enabled it), nor
+        // while a modal is up.
+        if lost_focus && !self.quitting && !modal_active && Config::get(|c| c.startup.onboarded && c.window.hide_on_focus_loss) {
             ui.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide();
         }
@@ -801,6 +840,8 @@ impl eframe::App for App {
                 self.install_prompt(ui.ctx());
             } else if self.ask_crash_reports {
                 self.crash_reports_prompt(ui.ctx());
+            } else if self.ask_tray_intro {
+                self.tray_intro_prompt(ui.ctx());
             }
 
             if self.state.is_config() {
