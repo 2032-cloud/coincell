@@ -285,11 +285,11 @@ Rail sections:
    time - see Versioning; a "development build" note shows when
    `!version::is_release()`), channel, check-automatically, on-update action, a
    **Check for updates** button + status line, a "last checked N ago" line, and a
-   **Download & install** button once a newer release is found. Drives
-   `App::updater` (see Updater). Automatic background checks on
-   `[updates].check_interval` run too; `[updates].on_update` = `notify` posts a
-   `Notice`, `install` auto-applies. _(`download` pre-staging isn't built -
-   treated as `notify`.)_
+   **Download & install** / **Install now** button once a newer release is found
+   or pre-staged. Drives `App::updater` (see Updater). Automatic background
+   checks on `[updates].check_interval` run too; `[updates].on_update` = `notify`
+   posts a `Notice`, `download` pre-fetches + verifies the binary then posts the
+   `Notice`, `install` auto-applies.
 7. **Save backups** - every pre-overwrite local snapshot the engine has kept
    (`Store::backups()`), newest first, labelled by game (name resolved from the
    catalog, else the raw instance id + original path for a deleted game). This is
@@ -969,12 +969,27 @@ Config › Updates *and* automatic background checks:
   `App::next_update_check`. That instant is set by `schedule_update_check` from
   the persisted `store` `meta` key `last_update_check` + `[updates].check_interval`
   (a never-run / overdue check is scheduled ~45 s out, not instantly). Skipped
-  while `updater.busy()` or an offer is already surfaced.
+  while `updater.busy()`, an offer is surfaced, or an update is `Staged`.
 - `drain_updater`, when a check finishes: persists `now` to `last_update_check`,
   re-arms the timer, and if it was an auto-check that found something, applies
-  `[updates].on_update` - `notify` (and `download`, un-implemented pre-staging)
-  → `notice::post(Notice::UpdateReady { version })` + leave it in
-  `Updater::Checked(Some)`; `install` → `start_update_install` straight away.
+  `[updates].on_update` -
+  - `notify` → `notice::post(Notice::UpdateReady { version })`, leave it in
+    `Updater::Checked(Some)`;
+  - `download` → `start_update_stage` (background `update::stage`: download +
+    verify + write the binary beside the installed exe, no swap) → `Updater::
+    Staged`; the `Notice::UpdateReady` is held until the bytes are actually on
+    disk (`App::notify_when_staged`);
+  - `install` → `start_update_install` straight away.
+- **Staged updates survive a restart.** `update::staged()` reads the
+  `.coincell.staged.meta` marker beside the exe and returns a `StagedUpdate`
+  when the binary is present and newer than the running build (self-cleaning
+  otherwise). `App::adopt_staged_update` (on `Next::Ready`) picks it back up into
+  `Updater::Staged` - or commits it immediately when `on_update = install`.
+  `install::uninstall` calls `update::discard_staged`.
+- `start_update_install` is instant when the update is already `Staged`
+  (`update::commit` = `self_replace` + relaunch, no re-download); otherwise it's
+  a full `update::apply` (= `stage` then `commit`). Config › Updates shows
+  **Install now** vs **Download & install** accordingly.
 - `start_update_check(auto)` carries the auto/manual distinction via
   `App::auto_check_pending`. `Notice::UpdateReady` rides the master
   `[notifications].enabled` only (no per-kind flag - `on_update = notify` is the
@@ -1007,20 +1022,30 @@ tiny, offline, a short public key that bakes in as a `const`.
   `version::TARGET` (the exact triple, emitted by `build.rs`) plus its
   `.minisig`. Returns `Option<Available>`. A `development` build can still call
   this to *see* the latest; `apply` refuses.
-- `apply(&Available)` - refuse unless `version::is_release()` **and**
+- `stage(&Available)` - refuse unless `version::is_release()` **and**
   `install::running_installed()`. Download archive + `.minisig`, verify the
   signature against the baked-in `assets/minisign.pub` (`minisign-verify`,
   `allow_legacy = true` so either prehashed or legacy rsign2 sigs pass), check
   the `.sha256` if present, unpack the binary (`zip` on Windows, `tar`+`flate2`
-  on Unix), stage it next to the installed exe (same volume), then
-  `self_replace::self_replace` (rename running exe aside, move new into place),
-  then spawn `<installed exe> --relaunched-after-update` and return `Ok`.
-- Handoff: `App` on `Ok` drops the sync engine, sets `quitting`, and closes the
-  window; the spawned process runs `ipc::acquire_wait(8s)`, retrying the
-  single-instance bind until the old process has released it.
+  on Unix), write it to `.coincell.staged[.exe]` next to the installed exe (same
+  volume; temp file + rename, so a killed download can't leave a half-written
+  binary) with a `.coincell.staged.meta` marker (`{tag, version}`). Returns
+  `StagedUpdate`.
+- `commit(&StagedUpdate)` - same guards, then `self_replace::self_replace`
+  (rename running exe aside, move staged into place), `discard_staged`, spawn
+  `<installed exe> --relaunched-after-update`, return `Ok`.
+- `apply(&Available)` = `stage` then `commit` - the do-it-all-now path
+  (`on_update = install`, or the Config button with nothing pre-staged).
+- `staged() -> Option<StagedUpdate>` - reads the marker; drops a marker with no
+  binary / an unparseable one / one not newer than the running build.
+  `discard_staged()` removes both files.
+- Handoff: `App` on a `commit` `Ok` drops the sync engine, sets `quitting`, and
+  closes the window; the spawned process runs `ipc::acquire_wait(8s)`, retrying
+  the single-instance bind until the old process has released it.
 - UI: `App::updater` (`Idle` / `Checking` / `Checked(Option<Available>)` /
-  `Installing` / `Restarting` / `Error`), advanced by `App::drain_updater` each
-  frame off two worker-thread channels, rendered by Config › Updates.
+  `Staging` / `Staged(StagedUpdate)` / `Installing` / `Restarting` / `Error`),
+  advanced by `App::drain_updater` each frame off worker-thread channels,
+  rendered by Config › Updates.
 
 **New deps**: `self-replace`, `minisign-verify`, `semver`;
 `zip` (`cfg(windows)`), `tar` + `flate2` (`cfg(unix)`); `winreg` (`cfg(windows)`,
@@ -1235,10 +1260,11 @@ None blocking. In rough build order:
    AppUserModelID class key for branded toasts; the install → usage-data →
    tray-explainer first-run chain; stay-visible-until-`onboarded`. Nothing left.
 7. **Self-updater** - **BUILT** (`src/update.rs` + `src/app`). Manual + automatic
-   checks (`check_interval`, persisted `last_update_check`), `on_update` =
-   notify / install applied; verify (minisign + sha256) → `self-replace` →
-   relaunch via the `ipc::acquire_wait` handoff. Left: `on_update = download`
-   pre-staging (currently == notify).
+   checks (`check_interval`, persisted `last_update_check`); all three `on_update`
+   actions (notify / download-pre-stage / install); `stage` (verify minisign +
+   sha256, write beside the exe + marker) → `commit` (`self-replace` → relaunch
+   via the `ipc::acquire_wait` handoff); a `Staged` update is re-adopted on the
+   next launch. Nothing left.
 8. **Emulator watch** - **BUILT** (`src/emulator_watch.rs`). `sysinfo` process
    poll; start/exit of a `[sync].emulators` basename → `Control::SyncNow`. Covers
    `on-emulator-exit` and the "pull right before you play" case without a real

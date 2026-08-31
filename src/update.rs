@@ -1,21 +1,30 @@
 //! Self-update against this repo's GitHub Releases.
 //!
-//! `check` queries the Releases API and semver-compares. `apply` downloads the
-//! archive for this exact target triple plus its detached `.minisig`, verifies
-//! the signature against the public key baked in at build time and the
-//! `.sha256`, unpacks the new binary, swaps it in with `self-replace`, and
-//! relaunches with `--relaunched-after-update` so the new process waits out the
-//! old one's single-instance lock (see `ipc::acquire_wait`).
+//! `check` queries the Releases API and semver-compares. The download splits in
+//! two so `[updates].on_update = download` can pre-fetch:
+//!
+//! - [`stage`] downloads the archive for this exact target triple plus its
+//!   detached `.minisig`, verifies the signature (against the key baked in at
+//!   build time) and the `.sha256`, unpacks the new binary, and writes it next
+//!   to the installed exe as `.coincell.staged` with a `.coincell.staged.meta`
+//!   marker. Nothing is swapped.
+//! - [`commit`] swaps a staged binary in with `self-replace` and relaunches with
+//!   `--relaunched-after-update` so the new process waits out the old one's
+//!   single-instance lock (see `ipc::acquire_wait`).
+//! - [`apply`] = `stage` then `commit`, the do-it-all-now path.
+//! - [`staged`] reports a leftover staged update from a previous session (and
+//!   self-cleans a stale or half-written one).
 //!
 //! All of this runs on a worker thread in `App`, never the UI thread. On a
-//! successful `apply`, `App` drops the sync engine and closes the window; the
+//! successful `commit`, `App` drops the sync engine and closes the window; the
 //! spawned process takes over.
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::constants::USER_AGENT;
 use crate::sync::sha256_hex;
@@ -27,6 +36,7 @@ const PUBKEY: &str = include_str!("../assets/minisign.pub");
 
 const BIN_STEM: &str = "coincell";
 const ARCHIVE_EXT: &str = if cfg!(windows) { ".zip" } else { ".tar.gz" };
+const EXE_SUFFIX: &str = if cfg!(windows) { ".exe" } else { "" };
 
 /// A release strictly newer than the running build.
 pub struct Available {
@@ -36,6 +46,22 @@ pub struct Available {
     archive_url: String,
     sig_url: String,
     sha_url: Option<String>,
+}
+
+/// A verified update already downloaded next to the installed exe, ready for an
+/// instant [`commit`] (this session or a later one).
+#[derive(Clone)]
+pub struct StagedUpdate {
+    pub version: semver::Version,
+    pub tag: String,
+    path: PathBuf,
+}
+
+/// `.coincell.staged.meta` next to the staged binary: what [`staged`] reads back.
+#[derive(Serialize, Deserialize)]
+struct Marker {
+    tag: String,
+    version: String,
 }
 
 #[derive(Deserialize)]
@@ -113,9 +139,9 @@ pub fn check(allow_prerelease: bool) -> Result<Option<Available>> {
     Ok(best)
 }
 
-/// Download, verify, and swap in `av`, then spawn the new binary. On `Ok`, the
-/// caller must shut this process down; the spawned one is taking over.
-pub fn apply(av: &Available) -> Result<()> {
+/// Download + verify `av` and write its binary next to the installed exe as a
+/// staged update. No swap, no relaunch - see [`commit`].
+pub fn stage(av: &Available) -> Result<StagedUpdate> {
     if !version::is_release() {
         bail!("this is a development build and doesn't self-update");
     }
@@ -148,25 +174,89 @@ pub fn apply(av: &Available) -> Result<()> {
         bail!("extracted binary is implausibly small ({} bytes)", new_bytes.len());
     }
 
-    // 4. Stage it next to the installed exe (same volume → atomic swap) and
-    //    replace the running executable.
-    let installed = crate::install::canonical_exe()?;
-    let dir = installed.parent().context("install dir has no parent")?;
-    let staged = dir.join(format!(".{BIN_STEM}.update-{}.tmp", std::process::id()));
-    std::fs::write(&staged, &new_bytes).with_context(|| format!("stage {}", staged.display()))?;
+    // 4. Write it beside the installed exe (same volume -> commit is an atomic
+    //    swap later). Temp file + rename so a killed download never leaves a
+    //    half-written binary that `staged()` would trust.
+    let (bin, meta) = staged_paths()?;
+    let tmp = bin.with_file_name(format!(".{BIN_STEM}.staged.download-{}", std::process::id()));
+    std::fs::write(&tmp, &new_bytes).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
+    std::fs::rename(&tmp, &bin).with_context(|| format!("stage {}", bin.display()))?;
 
-    let swap = self_replace::self_replace(&staged).context("swap in the new binary");
-    let _ = std::fs::remove_file(&staged);
+    let marker = serde_json::to_vec(&Marker { tag: av.tag.clone(), version: av.version.to_string() }).context("encode the staged-update marker")?;
+    std::fs::write(&meta, marker).with_context(|| format!("write {}", meta.display()))?;
+
+    tracing::info!("staged update {} ({}) at {}", av.version, av.tag, bin.display());
+    Ok(StagedUpdate { version: av.version.clone(), tag: av.tag.clone(), path: bin })
+}
+
+/// Swap a staged binary in for the running one and spawn it. On `Ok`, the caller
+/// must shut this process down; the spawned one is taking over.
+pub fn commit(staged: &StagedUpdate) -> Result<()> {
+    if !version::is_release() {
+        bail!("this is a development build and doesn't self-update");
+    }
+    if !crate::install::running_installed() {
+        bail!("updates apply to the installed copy, install CoinCell first");
+    }
+    let installed = crate::install::canonical_exe()?;
+
+    let swap = self_replace::self_replace(&staged.path).context("swap in the staged binary");
+    discard_staged(); // marker + the (already copied) staged file, even if the swap failed
     swap?;
 
-    tracing::info!("updated to {} ({}), relaunching", av.version, av.tag);
+    tracing::info!("updated to {} ({}), relaunching", staged.version, staged.tag);
     std::process::Command::new(&installed).arg("--relaunched-after-update").spawn().context("relaunch the updated binary")?;
     Ok(())
+}
+
+/// Download, verify, and swap in `av` in one go, then spawn the new binary.
+pub fn apply(av: &Available) -> Result<()> {
+    let staged = stage(av)?;
+    commit(&staged)
+}
+
+/// `(staged binary, marker)` paths, both next to the installed exe.
+fn staged_paths() -> Result<(PathBuf, PathBuf)> {
+    let installed = crate::install::canonical_exe()?;
+    let dir = installed.parent().context("install dir has no parent")?;
+    Ok((dir.join(format!(".{BIN_STEM}.staged{EXE_SUFFIX}")), dir.join(format!(".{BIN_STEM}.staged.meta"))))
+}
+
+/// A verified update from an earlier [`stage`] that hasn't been committed yet.
+/// Self-cleaning: a marker with no binary, an unreadable marker, or one that
+/// isn't newer than the running build is deleted and `None` returned.
+pub fn staged() -> Option<StagedUpdate> {
+    let (bin, meta) = staged_paths().ok()?;
+    if !bin.is_file() {
+        let _ = std::fs::remove_file(&meta);
+        return None;
+    }
+    let parsed = std::fs::read_to_string(&meta).ok().and_then(|t| serde_json::from_str::<Marker>(&t).ok());
+    let Some(marker) = parsed.filter(|m| marker_supersedes(&m.version, version::VERSION)) else {
+        discard_staged();
+        return None;
+    };
+    let version = semver::Version::parse(&marker.version).ok()?;
+    Some(StagedUpdate { version, tag: marker.tag, path: bin })
+}
+
+/// Remove any staged binary + marker. Best-effort.
+pub fn discard_staged() {
+    if let Ok((bin, meta)) = staged_paths() {
+        let _ = std::fs::remove_file(bin);
+        let _ = std::fs::remove_file(meta);
+    }
+}
+
+/// `true` when a staged marker's version parses and is strictly newer than
+/// `running`.
+fn marker_supersedes(marker_version: &str, running: &str) -> bool {
+    matches!((semver::Version::parse(marker_version), semver::Version::parse(running)), (Ok(m), Ok(r)) if m > r)
 }
 
 #[cfg(windows)]
@@ -217,5 +307,26 @@ impl Available {
             s.push('…');
             s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_supersedes_compares_semver() {
+        assert!(marker_supersedes("0.2.0", "0.1.9"));
+        assert!(!marker_supersedes("0.1.0", "0.1.0"));
+        assert!(!marker_supersedes("0.1.0", "0.2.0"));
+        assert!(!marker_supersedes("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn marker_round_trips_through_json() {
+        let json = serde_json::to_string(&Marker { tag: "v0.2.0".into(), version: "0.2.0".into() }).unwrap();
+        let back: Marker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag, "v0.2.0");
+        assert_eq!(back.version, "0.2.0");
     }
 }

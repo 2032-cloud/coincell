@@ -21,7 +21,7 @@ use crate::notice::{self, Notice};
 use crate::store::Store;
 use crate::sync::{EngineEvent, RestoreSource, SyncEngine};
 use crate::theme::{self, Scheme};
-use crate::update::{self, Available};
+use crate::update::{self, Available, StagedUpdate};
 
 /// Self-update UI state, driven from Config › Updates.
 pub(crate) enum Updater {
@@ -29,6 +29,12 @@ pub(crate) enum Updater {
     Checking(Receiver<Result<Option<Available>, String>>),
     /// Check finished: `Some` = a newer release, `None` = up to date.
     Checked(Option<Available>),
+    /// Downloading + verifying the archive in the background (`on_update =
+    /// download`, or a manual pre-download). Nothing swapped yet.
+    Staging(Receiver<Result<StagedUpdate, String>>),
+    /// A verified binary is on disk next to the installed exe; `commit` is
+    /// instant. Survives across sessions - re-adopted on the next launch.
+    Staged(StagedUpdate),
     Installing(Receiver<Result<(), String>>),
     /// Swap done; the window is closing and the new process is relaunching.
     Restarting,
@@ -42,6 +48,8 @@ impl Updater {
             Updater::Idle => format!("Version {}, not checked this session.", crate::version::VERSION),
             Updater::Checking(_) => "Checking for updates…".into(),
             Updater::Checked(av) => update::describe(av),
+            Updater::Staging(_) => "Downloading update…".into(),
+            Updater::Staged(s) => format!("Update {} downloaded, ready to install.", s.version),
             Updater::Installing(_) => "Downloading and installing…".into(),
             Updater::Restarting => "Restarting…".into(),
             Updater::Error(e) => format!("Update check failed: {e}"),
@@ -54,8 +62,15 @@ impl Updater {
             _ => None,
         }
     }
+    /// A verified, downloaded update waiting for an instant `commit`.
+    pub(crate) fn staged(&self) -> Option<&StagedUpdate> {
+        match self {
+            Updater::Staged(s) => Some(s),
+            _ => None,
+        }
+    }
     pub(crate) fn busy(&self) -> bool {
-        matches!(self, Updater::Checking(_) | Updater::Installing(_) | Updater::Restarting)
+        matches!(self, Updater::Checking(_) | Updater::Staging(_) | Updater::Installing(_) | Updater::Restarting)
     }
 }
 
@@ -158,6 +173,9 @@ pub struct App {
     /// The in-flight check was started by the timer, so `drain_updater` should
     /// apply `[updates].on_update` when it resolves.
     auto_check_pending: bool,
+    /// The in-flight `Staging` run came from an auto `on_update = download`, so
+    /// post `Notice::UpdateReady` once the binary is on disk.
+    notify_when_staged: bool,
 }
 
 impl App {
@@ -204,6 +222,7 @@ impl App {
             updater: Updater::Idle,
             next_update_check: None,
             auto_check_pending: false,
+            notify_when_staged: false,
         }
     }
 
@@ -306,6 +325,22 @@ impl App {
         self.home_app.deliver_save_pick(&instance_id, result);
     }
 
+    /// Pick up an update a previous session downloaded but never committed:
+    /// surface it in Config › Updates, and if `on_update = install`, apply it
+    /// now. Called once the account is `Ready`. `update::staged()` self-cleans a
+    /// stale marker, so this also sweeps a leftover from an older version.
+    fn adopt_staged_update(&mut self, ctx: &egui::Context) {
+        if self.updater.busy() {
+            return;
+        }
+        let Some(staged) = update::staged() else { return };
+        tracing::info!("resuming staged update {} ({})", staged.version, staged.tag);
+        self.updater = Updater::Staged(staged);
+        if crate::version::is_release() && Config::get(|c| c.updates.on_update) == UpdateAction::Install {
+            self.start_update_install(ctx);
+        }
+    }
+
     /// Kick off a GitHub Releases check on a worker thread. `auto` marks it as
     /// timer-driven so `drain_updater` applies `[updates].on_update` on finish.
     fn start_update_check(&mut self, ctx: &egui::Context, auto: bool) {
@@ -349,8 +384,8 @@ impl App {
             self.next_update_check = None;
             return;
         }
-        // Don't stomp an in-flight check or an already-surfaced offer.
-        if self.updater.busy() || self.updater.offer().is_some() {
+        // Don't stomp an in-flight check, a surfaced offer, or a staged update.
+        if self.updater.busy() || self.updater.offer().is_some() || self.updater.staged().is_some() {
             return;
         }
         if self.next_update_check.is_none() {
@@ -361,17 +396,41 @@ impl App {
         }
     }
 
-    /// Download + verify + swap the pending update on a worker thread.
-    fn start_update_install(&mut self, ctx: &egui::Context) {
+    /// Download + verify the pending update on a worker thread *without* swapping
+    /// it in - it lands as `Updater::Staged`. Backs `on_update = download`.
+    fn start_update_stage(&mut self, ctx: &egui::Context) {
         let Updater::Checked(Some(av)) = std::mem::replace(&mut self.updater, Updater::Idle) else {
             return;
         };
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::Builder::new()
+            .name("update-stage".into())
+            .spawn(move || {
+                let _ = tx.send(update::stage(&av).map_err(|e| format!("{e:#}")));
+                ctx.request_repaint();
+            })
+            .expect("spawn update-stage thread");
+        self.updater = Updater::Staging(rx);
+    }
+
+    /// Put the pending update in place on a worker thread: an instant `commit`
+    /// when it's already `Staged`, otherwise a full download-verify-swap.
+    fn start_update_install(&mut self, ctx: &egui::Context) {
+        let job: Box<dyn FnOnce() -> Result<(), String> + Send> = match std::mem::replace(&mut self.updater, Updater::Idle) {
+            Updater::Staged(staged) => Box::new(move || update::commit(&staged).map_err(|e| format!("{e:#}"))),
+            Updater::Checked(Some(av)) => Box::new(move || update::apply(&av).map_err(|e| format!("{e:#}"))),
+            other => {
+                self.updater = other;
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
             .name("update-apply".into())
             .spawn(move || {
-                let _ = tx.send(update::apply(&av).map_err(|e| format!("{e:#}")));
+                let _ = tx.send(job());
                 ctx.request_repaint();
             })
             .expect("spawn update-apply thread");
@@ -389,6 +448,12 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => Some(Updater::Error("the check thread stopped unexpectedly".into())),
                 Err(mpsc::TryRecvError::Empty) => None,
             },
+            Updater::Staging(rx) => match rx.try_recv() {
+                Ok(Ok(staged)) => Some(Updater::Staged(staged)),
+                Ok(Err(e)) => Some(Updater::Error(e)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Updater::Error("the download thread stopped unexpectedly".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
             Updater::Installing(rx) => match rx.try_recv() {
                 Ok(Ok(())) => Some(Updater::Restarting),
                 Ok(Err(e)) => Some(Updater::Error(e)),
@@ -400,6 +465,7 @@ impl App {
         let Some(state) = next else { return };
 
         let check_finished = matches!(self.updater, Updater::Checking(_));
+        let stage_finished = matches!(self.updater, Updater::Staging(_));
         let was_auto = std::mem::take(&mut self.auto_check_pending);
         self.updater = state;
 
@@ -410,10 +476,31 @@ impl App {
                 let version = av.version.to_string();
                 tracing::info!("auto update check: {version} available");
                 match Config::get(|c| c.updates.on_update) {
-                    // `download` pre-staging isn't built yet; surface it like `notify`.
-                    UpdateAction::Notify | UpdateAction::Download => notice::post(Notice::UpdateReady { version }),
+                    UpdateAction::Notify => notice::post(Notice::UpdateReady { version }),
+                    // Pre-fetch now; the notice waits until the bytes are on disk.
+                    UpdateAction::Download => {
+                        self.notify_when_staged = true;
+                        self.start_update_stage(ctx);
+                    }
                     UpdateAction::Install => self.start_update_install(ctx),
                 }
+            }
+        }
+
+        if stage_finished {
+            match &self.updater {
+                Updater::Staged(s) => {
+                    let version = s.version.to_string();
+                    tracing::info!("update {version} staged, ready to install");
+                    if std::mem::take(&mut self.notify_when_staged) {
+                        notice::post(Notice::UpdateReady { version });
+                    }
+                }
+                Updater::Error(e) => {
+                    tracing::warn!("staging update failed: {e}");
+                    self.notify_when_staged = false;
+                }
+                _ => {}
             }
         }
 
@@ -454,6 +541,8 @@ impl App {
         self.ask_tray_intro = false;
         self.next_update_check = None;
         self.auto_check_pending = false;
+        self.notify_when_staged = false;
+        self.updater = Updater::Idle;
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -721,6 +810,7 @@ impl App {
                 self.auth = AuthView::Ready;
                 self.focus_latch = true;
                 self.advance_first_run_prompts();
+                self.adopt_staged_update(ctx);
                 self.schedule_update_check();
                 self.start_sync(ctx);
             }

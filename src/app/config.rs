@@ -525,11 +525,13 @@ impl ConfigApp {
             if ui.add_enabled(!updater.busy(), egui::Button::new("Check for updates")).clicked() {
                 outcome = Some(ConfigOutcome::CheckForUpdate);
             }
-            if updater.offer().is_some() && crate::version::is_release() && ui.button("Download & install").clicked() {
+            let can_install = crate::version::is_release() && crate::install::running_installed();
+            let label = if updater.staged().is_some() { "Install now" } else { "Download & install" };
+            if can_install && (updater.staged().is_some() || updater.offer().is_some()) && ui.button(label).clicked() {
                 outcome = Some(ConfigOutcome::InstallUpdate);
             }
         });
-        if updater.offer().is_some() && !crate::install::running_installed() {
+        if (updater.offer().is_some() || updater.staged().is_some()) && !crate::install::running_installed() {
             ui.small("Updates apply to the installed copy. Install CoinCell (Startup section) first.");
         }
         outcome

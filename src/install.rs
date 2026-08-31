@@ -117,6 +117,7 @@ fn place_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Windows if it's the running process).
 pub fn uninstall(purge: bool) -> Result<()> {
     unregister();
+    crate::update::discard_staged(); // a pre-downloaded update we'll never apply now
 
     if purge {
         for dir in [PROJECT_DIRS.config_dir(), PROJECT_DIRS.data_dir(), PROJECT_DIRS.cache_dir()] {
