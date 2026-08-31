@@ -12,7 +12,7 @@ use crate::app::{icons, open_path};
 use crate::config::{Config, ConflictPolicy, LogLevel, PollInterval, Theme, UpdateAction, UpdateChannel, UploadTrigger};
 use crate::constants::BACKUP_DIR;
 use crate::store::Store;
-use crate::sync::humanize_since;
+use crate::sync::{Status, humanize_since};
 use crate::theme::homepage_path;
 
 /// What the config screen wants the parent `App` to do after this frame.
@@ -142,7 +142,7 @@ impl ConfigApp {
 
     pub fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {}
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding, catalog: &[GameInstance], updater: &Updater) -> ConfigOutcome {
+    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame, branding: &Branding, catalog: &[GameInstance], updater: &Updater, stream: Option<Status>) -> ConfigOutcome {
         let mut outcome = ConfigOutcome::Stay;
 
         egui::Panel::left("config_rail").resizable(false).exact_size(48.0).show(ui, |ui| {
@@ -187,7 +187,7 @@ impl ConfigApp {
                 match self.section {
                     Section::Account => self.account(ui, branding),
                     Section::Sync => {
-                        if self.sync(ui) {
+                        if self.sync(ui, stream) {
                             outcome = ConfigOutcome::SyncNow;
                         }
                     }
@@ -275,8 +275,9 @@ impl ConfigApp {
         }
     }
 
-    /// Returns `true` if "Sync now" was pressed this frame.
-    fn sync(&mut self, ui: &mut egui::Ui) -> bool {
+    /// Returns `true` if "Sync now" was pressed this frame. `stream` is the sync
+    /// engine's last connectivity status (`None` = engine not running).
+    fn sync(&mut self, ui: &mut egui::Ui, stream: Option<Status>) -> bool {
         let mut s = Config::get(|c| c.sync.clone());
         let mut changed = false;
 
@@ -297,8 +298,6 @@ impl ConfigApp {
                 changed |= combo(ui, "sync_conflict", &mut s.conflict, CONFLICTS);
                 ui.end_row();
             });
-            ui.add_space(4.0);
-            changed |= ui.checkbox(&mut s.pause_on_metered, "Pause on a metered connection").changed();
             ui.add_space(4.0);
             changed |= ui.checkbox(&mut s.watch_emulators, "Sync when an emulator starts or exits").changed();
         });
@@ -328,8 +327,25 @@ impl ConfigApp {
 
         ui.add_space(10.0);
         let sync_now = ui.add_enabled(s.enabled, egui::Button::new("Sync now")).on_hover_text("Check the server for changes right now").clicked();
-        ui.add_space(4.0);
-        ui.small("The engine also runs on the realtime stream and the poll interval above. Upload direction and per-game controls arrive with the Home window.");
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let (dot, text) = match (s.enabled, stream) {
+                (false, _) => (ui.visuals().weak_text_color(), "Sync is off"),
+                (true, Some(Status::Online)) => (OK_GREEN, "Connected"),
+                (true, _) => (ui.visuals().warn_fg_color, "Offline \u{2013} reconnecting"),
+            };
+            ui.colored_label(dot, "\u{25CF}");
+            ui.label(text);
+            if s.enabled {
+                let queued = Store::get(|st| st.queued_uploads().map(|q| q.len())).unwrap_or(0);
+                if queued > 0 {
+                    ui.weak(format!("\u{2022} {queued} waiting to upload"));
+                }
+            }
+        });
+        ui.add_space(2.0);
+        ui.small("The engine also runs on the realtime stream and the poll interval above.");
         sync_now
     }
 
@@ -810,3 +826,6 @@ const LOG_LEVELS: &[(&str, LogLevel)] = &[("Error", LogLevel::Error), ("Warn", L
 
 /// Per-game backup retention presets; `0` = keep everything. See `[backups].retain`.
 const BACKUP_RETAIN: &[(&str, usize)] = &[("10", 10), ("25", 25), ("50", 50), ("100", 100), ("Keep everything", 0)];
+
+/// "connected / healthy" green for the sync status dot (matches Home's).
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);

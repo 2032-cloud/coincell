@@ -263,10 +263,13 @@ Rail sections:
    is the rail's footer button, not here. _(No `sub` shown yet - would need a
    `GET /api/me` fetch the app doesn't do outside validation.)_
 2. **Sync** - `enabled`, poll interval, upload trigger, conflict policy, the
-   emulator-watch toggle + list, and a **Sync now** button
-   (`ConfigOutcome::SyncNow` → `SyncEngine::sync_now`), disabled when `enabled` is
-   off. _(No live status line yet - the engine emits `EngineEvent::Status` but
-   Home isn't built to show it.)_
+   emulator-watch toggle + list, a **Sync now** button (`ConfigOutcome::SyncNow`
+   → `SyncEngine::sync_now`, disabled when `enabled` is off), and a **live status
+   line**: a coloured dot + `Connected` / `Offline — reconnecting` / `Sync is
+   off` from `App.stream_online` (set in `drain_sync` off `EngineEvent::Status`,
+   cleared when the engine is dropped), plus `N waiting to upload` when
+   `Store::queued_uploads()` is non-empty. Passed into `ConfigApp::ui` alongside
+   `updater`.
 3. **Startup** - an **install / uninstall** block (see Install), launch on
    login, start hidden, and (a stray `[window]` toggle that fits here better
    than its own section) **hide the window when it loses focus** =
@@ -909,10 +912,13 @@ lib.
   lockstep for tarball builds / tooling / sanity) gates a `build` matrix over
   the two triples: `cargo build --release`, package (Windows `.zip`, Linux
   `.tar.gz`), **minisign-sign** each archive (see Updater), emit a `.sha256`,
-  and attach archive + `.minisig` + `.sha256` to the GitHub Release via
-  `softprops/action-gh-release`. `prerelease: true` when the tag name contains a
-  `-` (so `v0.2.0-rc.1` → GitHub pre-release, and `build.rs` → `prerelease`
-  channel).
+  and `upload-artifact` the three files. A single `release` job (`needs: build`)
+  then `download-artifact`s them all and makes one
+  `softprops/action-gh-release` call - publishing from the matrix instead had
+  two jobs racing to update one release, which double-appended the
+  auto-generated "Full Changelog" line. `prerelease: true` when the tag name
+  contains a `-` (so `v0.2.0-rc.1` → GitHub pre-release, and `build.rs` →
+  `prerelease` channel).
 - **Nightlies** - not a third channel, not per-push. If ever wanted, a scheduled
   job cuts a `vX.Y.Z-nightly.<date>` pre-release when `main` moved; it rides the
   existing `prerelease` channel and stays monotonic.

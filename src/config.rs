@@ -191,8 +191,6 @@ pub struct SyncSettings {
     pub poll: PollInterval,
     pub upload_trigger: UploadTrigger,
     pub conflict: ConflictPolicy,
-    /// Pause network activity on a metered connection (Windows).
-    pub pause_on_metered: bool,
     /// Nudge the sync engine when a watched emulator starts or exits.
     pub watch_emulators: bool,
     /// Executable basenames (no extension) the watcher looks for.
@@ -202,15 +200,7 @@ pub struct SyncSettings {
 
 impl Default for SyncSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            poll: PollInterval::Auto,
-            upload_trigger: UploadTrigger::OnChange,
-            conflict: ConflictPolicy::Ask,
-            pause_on_metered: true,
-            watch_emulators: true,
-            emulators: default_emulators(),
-        }
+        Self { enabled: true, poll: PollInterval::Auto, upload_trigger: UploadTrigger::OnChange, conflict: ConflictPolicy::Ask, watch_emulators: true, emulators: default_emulators() }
     }
 }
 

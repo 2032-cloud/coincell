@@ -19,7 +19,7 @@ use crate::config::{Config, UpdateAction, UpdateChannel};
 use crate::constants::CLIENT_NAME;
 use crate::notice::{self, Notice};
 use crate::store::Store;
-use crate::sync::{EngineEvent, RestoreSource, StuckReason, SyncEngine};
+use crate::sync::{EngineEvent, RestoreSource, Status, StuckReason, SyncEngine};
 use crate::theme::{self, Scheme};
 use crate::update::{self, Available, StagedUpdate};
 
@@ -176,6 +176,9 @@ pub struct App {
     /// The in-flight `Staging` run came from an auto `on_update = download`, so
     /// post `Notice::UpdateReady` once the binary is on disk.
     notify_when_staged: bool,
+    /// The sync engine's last reported stream connectivity, for the Config ›
+    /// Sync status line. `None` while no engine is running.
+    stream_online: Option<Status>,
 }
 
 impl App {
@@ -223,6 +226,7 @@ impl App {
             next_update_check: None,
             auto_check_pending: false,
             notify_when_staged: false,
+            stream_online: None,
         }
     }
 
@@ -249,7 +253,10 @@ impl App {
     /// Drain what the engine has surfaced. Download/write already happened on the
     /// worker; this keeps the catalog current and reacts to session expiry.
     fn drain_sync(&mut self, ctx: &egui::Context) {
-        let Some(engine) = &self.sync else { return };
+        let Some(engine) = &self.sync else {
+            self.stream_online = None;
+            return;
+        };
         let mut session_expired = false;
         for event in engine.events() {
             match event {
@@ -263,7 +270,10 @@ impl App {
                         row.latest_save = Some(latest);
                     }
                 }
-                EngineEvent::Status(status) => tracing::debug!("stream {status:?}"),
+                EngineEvent::Status(status) => {
+                    tracing::debug!("stream {status:?}");
+                    self.stream_online = Some(status);
+                }
                 EngineEvent::Pulled { instance_id } => {
                     tracing::info!("pulled newer save for {instance_id}");
                     notice::post(Notice::Pulled { game: self.game_label(&instance_id) });
@@ -1014,7 +1024,7 @@ impl eframe::App for App {
             }
 
             if self.state.is_config() {
-                match self.config_app.ui(ui, frame, &self.branding, &self.catalog, &self.updater) {
+                match self.config_app.ui(ui, frame, &self.branding, &self.catalog, &self.updater, self.stream_online) {
                     ConfigOutcome::Stay => {}
                     ConfigOutcome::SyncNow => {
                         if let Some(engine) = &self.sync {
