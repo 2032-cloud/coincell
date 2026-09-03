@@ -19,19 +19,59 @@ pub struct DeviceConfig {
     pub api_base: String,
 }
 
-/// `GET /api/me`: only the fields a device session uses. The payload carries
-/// more (Auth0 profile, session id, the account's `preferred_region` which the
-/// server already applies to game names) and its exact shape varies by domain,
-/// so everything here is lenient: a missing field must never fail the parse,
-/// since that's also the "session is valid" probe.
+/// `GET /api/me`: only the two fields a device session actually uses. The
+/// unified payload also carries a nested `user` block (Auth0 `sub` / `email`
+/// / …), `preferred_region` (the server already applies it to game names), and
+/// `account_status` / deletion timestamps (always `"active"` / `null` on the
+/// device API). Everything here stays lenient - a missing field must never fail
+/// the parse, since this doubles as the "session is valid" probe - so both the
+/// old flat shape and the unified one decode.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Me {
-    /// Ignored today; kept lenient so validation never hinges on it.
-    #[serde(default)]
-    pub sub: String,
     /// `None` = follow system; `Some(true/false)` = light/dark.
     #[serde(default)]
     pub theme: Option<bool>,
+    /// Account tier, straight off `users.role`. Only `Admin` / `SuperAdmin` may
+    /// read or write the diagnostics fixture store (see [`DiagFixture`]).
+    #[serde(default)]
+    pub role: Role,
+}
+
+/// The `role` field on `GET /api/me`. Unknown values decode as [`Role::Other`]
+/// (unprivileged) so a new tier never breaks the session probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    User,
+    Admin,
+    SuperAdmin,
+    #[serde(other)]
+    Other,
+}
+
+impl Role {
+    /// `true` for `Admin` and above - unlocks the diagnostics fixture store.
+    pub fn privileged(self) -> bool {
+        matches!(self, Role::Admin | Role::SuperAdmin)
+    }
+}
+
+/// One entry in the diagnostics fixture store (`/api/diag/*`): a reference
+/// binary a privileged user published for a game, keyed by console + game slug,
+/// so others testing the same game don't each have to locate the file. Used
+/// only to pre-fill a launcher content path; nothing else consumes it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiagFixture {
+    #[serde(alias = "consoleSlug")]
+    pub console_slug: String,
+    #[serde(alias = "gameSlug")]
+    pub game_slug: String,
+    pub filename: String,
+    #[serde(default, alias = "sizeBytes")]
+    pub size_bytes: u64,
+    #[serde(alias = "contentHash")]
+    pub content_hash: String,
 }
 
 /// `GET /api/branding`: the service's presentation layer (name, palette,
@@ -282,6 +322,11 @@ pub(crate) struct Saves {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct DiagRoms {
+    pub roms: Vec<DiagFixture>,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct IdOnly {
     pub id: String,
 }
@@ -303,18 +348,34 @@ mod tests {
 
     #[test]
     fn me_is_lenient() {
-        // the live cr. /api/me shape (server resolves game names, client just
-        // reads `theme`)
+        // the old flat cr. shape (no `role`, `sub` at top level)
         let me: Me = serde_json::from_str(r#"{"sub":"auth0|x","theme":null,"preferred_region":"USA"}"#).unwrap();
         assert!(me.theme.is_none());
+        assert_eq!(me.role, Role::User); // absent -> default
 
-        // missing fields default, parse still succeeds (it's also the session probe)
-        let me: Me = serde_json::from_str("{}").unwrap();
-        assert_eq!(me.sub, "");
+        // missing everything still parses (it's also the session probe)
+        assert!(serde_json::from_str::<Me>("{}").is_ok());
 
-        // a different domain's shape (nested `user`, extra keys) still parses
-        let me: Me = serde_json::from_str(r#"{"user":{"sub":"x"},"theme":true,"iss":"..."}"#).unwrap();
+        // the unified shape: nested `user`, top-level `role`, deletion fields
+        let me: Me = serde_json::from_str(
+            r#"{"user":{"sub":"x","name":null,"email":"a@b.c","picture":null},"theme":true,
+                "preferred_region":"USA","role":"admin","account_status":"active",
+                "deletion_requested_at":null,"purge_at":null}"#,
+        )
+        .unwrap();
         assert_eq!(me.theme, Some(true));
+        assert!(me.role.privileged());
+    }
+
+    #[test]
+    fn role_defaults_and_tolerates_the_unknown() {
+        assert_eq!(serde_json::from_str::<Me>("{}").unwrap().role, Role::User);
+        assert_eq!(serde_json::from_str::<Me>(r#"{"role":"super_admin"}"#).unwrap().role, Role::SuperAdmin);
+        assert!(serde_json::from_str::<Me>(r#"{"role":"admin"}"#).unwrap().role.privileged());
+        // a tier the client doesn't know decodes as unprivileged, never an error
+        let me: Me = serde_json::from_str(r#"{"role":"moderator"}"#).unwrap();
+        assert_eq!(me.role, Role::Other);
+        assert!(!me.role.privileged());
     }
 
     #[test]

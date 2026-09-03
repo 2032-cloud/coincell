@@ -18,8 +18,8 @@ pub use device::{DeviceEvent, DeviceFlow, SessionCheck, SessionStatus, open_in_b
 pub use error::{Error, Result};
 pub use events::{EventStream, StreamEvent};
 pub use models::{
-    BrandAsset, BrandColors, BrandIdentity, BrandPalette, BrandTypography, BrandUsage, Branding, Console, DeviceConfig, Game, GameInstance, Highlight, InstanceArt, Me, NewGameInstance, SaveMeta,
-    Timestamp,
+    BrandAsset, BrandColors, BrandIdentity, BrandPalette, BrandTypography, BrandUsage, Branding, Console, DeviceConfig, DiagFixture, Game, GameInstance, Highlight, InstanceArt, Me, NewGameInstance,
+    Role, SaveMeta, Timestamp,
 };
 pub use sync::{SyncEvent, SyncStream};
 

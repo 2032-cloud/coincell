@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 
 use reqwest::blocking::RequestBuilder;
 
-use crate::api::models::{Consoles, GameInstances, Games, IdOnly, Saves, Upload};
-use crate::api::{Branding, Console, DeviceConfig, Error, Game, GameInstance, Me, NewGameInstance, Result, SaveMeta, expect_no_content, read_json};
+use crate::api::models::{Consoles, DiagRoms, GameInstances, Games, IdOnly, Saves, Upload};
+use crate::api::{Branding, Console, DeviceConfig, DiagFixture, Error, Game, GameInstance, Me, NewGameInstance, Result, SaveMeta, expect_no_content, read_json};
 
 static USER_AGENT: OnceLock<String> = OnceLock::new();
 
@@ -129,6 +129,43 @@ impl Client {
         }
     }
 
+    // ---- diagnostics fixture store (privileged) -------------------------
+
+    /// `GET /api/diag/roms`: everything the store currently holds. The list rows
+    /// carry extra bookkeeping (`uploaded_at`, `uploaded_by*`, `game_name`) that
+    /// `DiagFixture` just ignores.
+    pub fn diag_index(&self) -> Result<Vec<DiagFixture>> {
+        Ok(read_json::<DiagRoms>(self.get("/api/diag/roms").send()?)?.roms)
+    }
+
+    /// `GET /api/diag/roms/:console/:game`: the raw fixture bytes.
+    pub fn diag_fetch(&self, console_slug: &str, game_slug: &str) -> Result<Vec<u8>> {
+        let resp = self.get(&format!("/api/diag/roms/{console_slug}/{game_slug}")).send()?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp.bytes()?.to_vec());
+        }
+        match status.as_u16() {
+            401 | 403 => Err(Error::Unauthorized),
+            code => Err(Error::Status { status: code, body: resp.text().unwrap_or_default() }),
+        }
+    }
+
+    /// `POST /api/diag/roms/:console/:game`: publish `bytes` as the fixture for
+    /// this game. The filename rides in `X-Rom-Filename`; the server caps the
+    /// size and rate-limits.
+    pub fn diag_upload(&self, console_slug: &str, game_slug: &str, filename: &str, bytes: Vec<u8>) -> Result<DiagFixture> {
+        let resp =
+            self.post(&format!("/api/diag/roms/{console_slug}/{game_slug}")).header("X-Rom-Filename", filename).header(reqwest::header::CONTENT_TYPE, "application/octet-stream").body(bytes).send()?;
+        read_json(resp)
+    }
+
+    /// `DELETE /api/diag/roms/:console/:game` (`204`). Not on the app flow yet;
+    /// kept so the store is fully manageable from the client.
+    pub fn diag_delete(&self, console_slug: &str, game_slug: &str) -> Result<()> {
+        expect_no_content(self.delete(&format!("/api/diag/roms/{console_slug}/{game_slug}")).send()?)
+    }
+
     // ---- internals -------------------------------------------------------
 
     fn get(&self, path: &str) -> RequestBuilder {
@@ -137,6 +174,10 @@ impl Client {
 
     fn post(&self, path: &str) -> RequestBuilder {
         self.http.post(self.url(path)).bearer_auth(&self.session)
+    }
+
+    fn delete(&self, path: &str) -> RequestBuilder {
+        self.http.delete(self.url(path)).bearer_auth(&self.session)
     }
 
     fn url(&self, path: &str) -> String {

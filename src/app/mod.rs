@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
-use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, GameInstance, SessionCheck, SessionStatus};
+use crate::api::{self, Branding, Client, DeviceConfig, DeviceEvent, DeviceFlow, DiagFixture, GameInstance, Role, SessionCheck, SessionStatus};
 use crate::app::config::{ConfigApp, ConfigOutcome};
 use crate::app::home::{HomeApp, HomeOutcome, HomeView};
 use crate::app::icons::MINIMISE;
@@ -132,6 +132,36 @@ enum PickKind {
     Content { launch_after: bool },
 }
 
+/// Client state for the diagnostics fixture store. Inert unless the account is
+/// [`Role::privileged`]: at that point CoinCell pre-fills launcher content paths
+/// from the store, and offers to publish a manually-picked file back to it.
+#[derive(Default)]
+struct Diag {
+    /// The store index, fetched once per session; kept current after an upload.
+    index: Vec<DiagFixture>,
+    /// `true` once the index has been fetched at least once.
+    have_index: bool,
+    /// A running provision pass (fetch index + download + set content paths).
+    pass: Option<Receiver<DiagResult>>,
+    /// A running upload of a manually-picked file.
+    upload: Option<Receiver<Result<DiagFixture, String>>>,
+    /// A pending "publish this file?" modal for an admin who just picked one.
+    ask_publish: Option<PublishFixture>,
+}
+
+struct DiagResult {
+    index: Vec<DiagFixture>,
+    /// How many instances got a content path filled in.
+    provisioned: usize,
+}
+
+struct PublishFixture {
+    game_name: String,
+    console_slug: String,
+    game_slug: String,
+    path: std::path::PathBuf,
+}
+
 /// A game the user launched through CoinCell (one at a time).
 struct Launch {
     instance_id: String,
@@ -206,6 +236,9 @@ pub struct App {
     /// A game launched through CoinCell's per-console emulator profiles. One at
     /// a time; `None` when nothing is running or being checked.
     launch: Option<Launch>,
+    /// Account tier from `GET /api/me`; gates the diagnostics fixture store.
+    role: Role,
+    diag: Diag,
 }
 
 impl App {
@@ -255,6 +288,8 @@ impl App {
             notify_when_staged: false,
             stream_online: None,
             launch: None,
+            role: Role::User,
+            diag: Diag::default(),
         }
     }
 
@@ -288,6 +323,7 @@ impl App {
         let mut session_expired = false;
         let mut launch_ready: Option<String> = None;
         let mut launch_cancel = false;
+        let mut provision_after = false;
         let checking = match &self.launch {
             Some(Launch { instance_id, phase: LaunchPhase::Checking { .. } }) => Some(instance_id.clone()),
             _ => None,
@@ -297,6 +333,7 @@ impl App {
                 EngineEvent::Hydrated { instances } => {
                     self.catalog = instances;
                     self.catalog_ready = true;
+                    provision_after = true;
                 }
                 EngineEvent::SaveAdvanced { instance_id, latest } => {
                     if let Some(row) = self.catalog.iter_mut().find(|g| g.id == instance_id) {
@@ -355,6 +392,9 @@ impl App {
         } else if let Some(id) = launch_ready {
             self.spawn_emulator(&id);
         }
+        if provision_after {
+            self.provision_diag(ctx);
+        }
     }
 
     /// A human name for an instance id, for notice text; the id itself if the
@@ -399,6 +439,7 @@ impl App {
                     return;
                 }
                 self.home_app.refresh_instances();
+                self.maybe_offer_diag_publish(&instance_id, &path);
                 if launch_after {
                     self.begin_play(ctx, instance_id);
                 }
@@ -494,6 +535,136 @@ impl App {
     fn stop_emulator(&mut self) {
         if let Some(Launch { phase: LaunchPhase::Running { child }, .. }) = &mut self.launch {
             let _ = child.kill();
+        }
+    }
+
+    // ---- diagnostics fixture store ------------------------------------------
+
+    /// After a privileged user picks a content file by hand, and the store has
+    /// no fixture for that game yet, queue the "publish it?" modal.
+    fn maybe_offer_diag_publish(&mut self, instance_id: &str, path: &std::path::Path) {
+        // Wait until we've seen the index, so we can actually tell whether the
+        // store already has one.
+        if !self.role.privileged() || !self.diag.have_index || self.diag.ask_publish.is_some() {
+            return;
+        }
+        let Some(inst) = self.catalog.iter().find(|g| g.id == instance_id) else { return };
+        let Some(game_slug) = inst.game_slug.clone() else { return };
+        let have = self.diag.index.iter().any(|f| f.console_slug == inst.console_slug && f.game_slug == game_slug);
+        if have {
+            return;
+        }
+        self.diag.ask_publish = Some(PublishFixture { game_name: inst.name.clone(), console_slug: inst.console_slug.clone(), game_slug, path: path.to_path_buf() });
+    }
+
+    /// If the account is privileged, run a background pass: fetch the fixture
+    /// index and, for every mapped instance with a known game and no content
+    /// path, download its fixture (cached, hash-checked) and set it as the
+    /// launcher content path. No-op otherwise, or while a pass is already going.
+    fn provision_diag(&mut self, ctx: &egui::Context) {
+        if !self.role.privileged() || self.diag.pass.is_some() {
+            return;
+        }
+        let Some(client) = api_client() else { return };
+
+        // (instance_id, console_slug, game_slug) for mapped instances missing a
+        // content path. Custom instances have no game slug, so no fixture.
+        let need: std::collections::HashMap<String, bool> = Store::get(|s| s.instances()).map(|v| v.into_iter().map(|r| (r.game_instance_id, r.content_path.is_some())).collect()).unwrap_or_default();
+        let work: Vec<(String, String, String)> =
+            self.catalog.iter().filter_map(|g| Some((g.id.clone(), g.console_slug.clone(), g.game_slug.clone()?))).filter(|(id, _, _)| matches!(need.get(id), Some(false))).collect();
+        if work.is_empty() && self.diag.have_index {
+            return; // nothing to fill and the index for the publish check is fresh enough
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("diag-provision".into())
+            .spawn(move || {
+                let _ = tx.send(run_diag_provision(&client, work));
+                ctx.request_repaint();
+            })
+            .expect("spawn diag-provision thread");
+        self.diag.pass = Some(rx);
+    }
+
+    /// Publish a manually-picked file as the fixture for its game.
+    fn start_diag_upload(&mut self, ctx: &egui::Context, pf: PublishFixture) {
+        let Some(client) = api_client() else { return };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("diag-upload".into())
+            .spawn(move || {
+                let out = (|| {
+                    let bytes = std::fs::read(&pf.path).map_err(|e| format!("read {}: {e}", pf.path.display()))?;
+                    let name = pf.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "fixture.bin".into());
+                    client.diag_upload(&pf.console_slug, &pf.game_slug, &name, bytes).map_err(|e| format!("{e:#}"))
+                })();
+                let _ = tx.send(out);
+                ctx.request_repaint();
+            })
+            .expect("spawn diag-upload thread");
+        self.diag.upload = Some(rx);
+    }
+
+    /// Drain the diagnostics worker channels each frame.
+    fn drain_diag(&mut self) {
+        if let Some(rx) = &self.diag.pass
+            && let Ok(res) = rx.try_recv()
+        {
+            self.diag.pass = None;
+            self.diag.index = res.index;
+            self.diag.have_index = true;
+            if res.provisioned > 0 {
+                tracing::info!("diag: filled {} launcher content path(s) from the fixture store", res.provisioned);
+                self.home_app.refresh_instances();
+            }
+        }
+        if let Some(rx) = &self.diag.upload
+            && let Ok(res) = rx.try_recv()
+        {
+            self.diag.upload = None;
+            match res {
+                Ok(fx) => {
+                    tracing::info!("diag: published a fixture for {}/{}", fx.console_slug, fx.game_slug);
+                    self.diag.index.retain(|f| !(f.console_slug == fx.console_slug && f.game_slug == fx.game_slug));
+                    self.diag.index.push(fx);
+                }
+                Err(e) => self.home_app.note_error(format!("Couldn't publish the diagnostic fixture: {e}")),
+            }
+        }
+    }
+
+    /// One-time modal for a privileged user who just picked a file by hand and
+    /// the store doesn't have one for that game yet.
+    fn diag_publish_prompt(&mut self, ctx: &egui::Context) {
+        let Some(pf) = &self.diag.ask_publish else { return };
+        let game = pf.game_name.clone();
+        let resp = egui::Modal::new(egui::Id::new("diag_publish")).show(ctx, |ui| {
+            ui.set_max_width(300.0);
+            ui.heading("Add to the diagnostics store?");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Publish this file as the diagnostic fixture for {game}? Other privileged accounts testing {game} will then get it automatically, so nobody has to track the file down twice."
+            ));
+            ui.add_space(12.0);
+            let mut pick = None;
+            ui.horizontal(|ui| {
+                if ui.button("Not now").clicked() {
+                    pick = Some(false);
+                }
+                if ui.button("Publish").clicked() {
+                    pick = Some(true);
+                }
+            });
+            pick
+        });
+        if let Some(publish) = resp.inner.or_else(|| resp.should_close().then_some(false)) {
+            let pf = self.diag.ask_publish.take().expect("checked above");
+            if publish {
+                self.start_diag_upload(ctx, pf);
+            }
         }
     }
 
@@ -717,6 +888,8 @@ impl App {
         self.updater = Updater::Idle;
         // Stop tracking any launched emulator; leave it running.
         self.launch = None;
+        self.role = Role::User;
+        self.diag = Diag::default();
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -966,6 +1139,7 @@ impl App {
             AuthView::Validating { check } => match check.poll() {
                 Some(SessionStatus::Valid(me)) => {
                     self.account_theme = Some(me.theme);
+                    self.role = me.role;
                     Next::Ready
                 }
                 Some(SessionStatus::Invalid) => Next::LoggedOut(Some(Arc::from("Your session has expired. Please sign in again."))),
@@ -1121,6 +1295,7 @@ impl eframe::App for App {
         self.drain_sync(ctx);
         notice::pump();
         self.drain_pending_pick(ctx);
+        self.drain_diag();
         self.tick_launch(ctx);
         self.tick_update_check(ctx);
         self.drain_updater(ctx);
@@ -1146,7 +1321,7 @@ impl eframe::App for App {
         let busy_auth = matches!(self.auth, AuthView::Connecting { .. } | AuthView::Validating { .. });
         // Anything that hands focus to a native window we don't own, plus the
         // first-run modals: losing focus to one of those must not minimise us.
-        let modal_active = busy_auth || self.pending_pick.is_some() || self.ask_install || self.ask_crash_reports || self.ask_tray_intro;
+        let modal_active = busy_auth || self.pending_pick.is_some() || self.ask_install || self.ask_crash_reports || self.ask_tray_intro || self.diag.ask_publish.is_some();
 
         let lost_focus = ui.input(|i| {
             if i.focused {
@@ -1174,6 +1349,8 @@ impl eframe::App for App {
                 self.crash_reports_prompt(ui.ctx());
             } else if self.ask_tray_intro {
                 self.tray_intro_prompt(ui.ctx());
+            } else if self.diag.ask_publish.is_some() {
+                self.diag_publish_prompt(ui.ctx());
             }
 
             if self.state.is_config() {
@@ -1297,4 +1474,51 @@ fn api_client() -> Option<Client> {
 fn waker(ctx: &egui::Context) -> impl Fn() + Send + Clone + 'static {
     let ctx = ctx.clone();
     move || ctx.request_repaint()
+}
+
+/// Worker body for [`App::provision_diag`]: fetch the fixture index, then for
+/// each `(instance, console, game)` that has a matching fixture, make sure the
+/// bytes are cached and point the instance's content path at them.
+fn run_diag_provision(client: &Client, work: Vec<(String, String, String)>) -> DiagResult {
+    let index = client.diag_index().unwrap_or_else(|e| {
+        tracing::debug!("diag index: {e:#}");
+        Vec::new()
+    });
+    let mut provisioned = 0;
+    for (id, console, game) in work {
+        let Some(fx) = index.iter().find(|f| f.console_slug == console && f.game_slug == game) else { continue };
+        match ensure_fixture_cached(client, fx) {
+            Ok(path) => {
+                if Store::write(|s| s.set_content_path(&id, Some(&path))).is_ok() {
+                    provisioned += 1;
+                }
+            }
+            Err(e) => tracing::warn!("diag fixture for {id}: {e:#}"),
+        }
+    }
+    DiagResult { index, provisioned }
+}
+
+/// Ensure a fixture's bytes sit in the cache and return the file path. Layout:
+/// `<cache>/diag/<hash-prefix>/<original filename>`. A present file is trusted
+/// only if its hash still matches; anything else is re-fetched.
+fn ensure_fixture_cached(client: &Client, fx: &DiagFixture) -> anyhow::Result<std::path::PathBuf> {
+    let dir = crate::constants::PROJECT_DIRS.cache_dir().join("diag").join(&fx.content_hash[..fx.content_hash.len().min(12)]);
+    let name = std::path::Path::new(&fx.filename).file_name().unwrap_or(std::ffi::OsStr::new("fixture.bin"));
+    let path = dir.join(name);
+
+    if let Ok(bytes) = std::fs::read(&path)
+        && crate::sync::sha256_hex(&bytes) == fx.content_hash
+    {
+        return Ok(path);
+    }
+
+    let bytes = client.diag_fetch(&fx.console_slug, &fx.game_slug).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    if crate::sync::sha256_hex(&bytes) != fx.content_hash {
+        anyhow::bail!("downloaded fixture hash didn't match the index");
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, &bytes)?;
+    tracing::info!("diag: cached fixture {} ({} bytes)", fx.filename, bytes.len());
+    Ok(path)
 }

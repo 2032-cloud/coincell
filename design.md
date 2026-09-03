@@ -874,6 +874,43 @@ per-console command + args and a per-instance content path.
 - The launcher `command` basenames are folded into the emulator-watch set, so
   configuring a launcher also improves passive exit-sync for that emulator.
 
+### Diagnostics fixture store **[BUILT]**
+
+A distributed convenience for power users testing the same games: privileged
+accounts can stash a reference binary per game on the server so others don't each
+have to locate the file. User-supplied fixtures only; entirely inert for regular
+accounts (no requests, no UI).
+
+- **Gate**: the unified `GET /api/me` carries a top-level `role`
+  (`api::Role` - `user | admin | super_admin`, unknown → `Other`, all
+  unprivileged bar admin/super). `App.role` is set from `me.role` on session
+  validation; `Role::privileged()` unlocks everything below. `Me` decodes both
+  the unified shape (nested `user{sub,email,…}`, `role`, `account_status`,
+  deletion timestamps) and the old flat one, and only reads `theme` + `role`.
+  *(As of 2026-09-03 the flat shape without `role` was still live-deploying;
+  absent `role` safely defaults to `User`, so the feature just stays inert until
+  the unified `/api/me` rolls out.)*
+- **API** (`api::Client`, `/api/diag/roms`, all verified live): `diag_index()`
+  (list - the payload is `{ "roms": [...] }`, unwrapped via the `DiagRoms`
+  envelope; rows also carry `uploaded_at` / `uploaded_by*` / `game_name` that
+  `DiagFixture` ignores), `diag_fetch(console, game)` (raw
+  `application/octet-stream` bytes), `diag_upload(console, game, filename,
+  bytes)` (`X-Rom-Filename` header, `application/octet-stream` body → `201` with
+  the `DiagFixture` fields; server caps size + rate-limits),
+  `diag_delete(console, game)` (`204`; `404` "No ROM for that game" if absent -
+  not on the app flow, kept for completeness). Type: `api::DiagFixture {
+  console_slug, game_slug, filename, size_bytes, content_hash }`.
+- **Provision** (`App::provision_diag`, on each `Hydrated` for a privileged
+  account): a worker fetches the index, then for every mapped instance with a
+  known `game_slug` and no `content_path`, `ensure_fixture_cached` downloads +
+  hash-checks the fixture into `<cache>/diag/<hash-prefix>/<filename>` and
+  `Store::set_content_path` points the instance at it. So Play "just works" for
+  games the store covers.
+- **Publish** (`App::maybe_offer_diag_publish`): when a privileged user picks a
+  content file *by hand* and the store has nothing for that game yet, a one-time
+  modal offers to `diag_upload` it; success is folded into the local index.
+- Session teardown resets `role` + the whole `Diag` state.
+
 ### Conflict policy
 
 Conflict = local file hash ≠ last-synced hash **and** remote latest hash ≠
