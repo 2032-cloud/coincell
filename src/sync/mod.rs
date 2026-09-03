@@ -89,6 +89,11 @@ pub enum EngineEvent {
     Conflict {
         instance_id: String,
     },
+    /// A `Control::Recheck` for this instance finished (pulled, marked synced, or
+    /// nothing to do). The launcher waits on this before spawning the emulator.
+    Rechecked {
+        instance_id: String,
+    },
     /// One instance's sync is wedged and won't recover on its own: an incoming
     /// update was held back because the local save couldn't be snapshotted
     /// first, or an upload has failed on repeat. Toast-worthy, unlike [`Self::Error`].
@@ -272,6 +277,7 @@ impl<W: Fn() + Send + Clone + 'static> Worker<W> {
                     Control::Recheck { instance_id } => {
                         self.resync_watches();
                         self.recheck_one(&instance_id);
+                        self.emit(EngineEvent::Rechecked { instance_id });
                     }
                     Control::ResolveConflict { instance_id, keep_local } => self.resolve_conflict(&instance_id, keep_local),
                     Control::Restore { instance_id, source } => self.restore(&instance_id, source),

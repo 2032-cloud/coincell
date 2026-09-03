@@ -95,6 +95,10 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX ix_save_backups_instance ON save_backups(game_instance_id);
     ",
+    // v2 -> v3: the ROM / content file to hand the emulator when launching this
+    // instance from CoinCell. Nullable: only set for games the user wants to
+    // launch. The emulator profile itself lives in `[launchers]` per console.
+    "ALTER TABLE instances ADD COLUMN content_path TEXT;",
 ];
 
 const CURSOR_KEY: &str = "sync_cursor";
@@ -110,6 +114,8 @@ pub struct InstanceRecord {
     pub console_slug: Option<String>,
     /// Per-instance pause: keep watching the filesystem, do no network work.
     pub paused: bool,
+    /// ROM / content file to launch this instance with, if the user set one.
+    pub content_path: Option<PathBuf>,
     /// Hash disk and server last agreed on.
     pub last_synced_hash: Option<String>,
     /// The server save row for [`Self::last_synced_hash`].
@@ -171,7 +177,7 @@ pub struct SaveBackup {
 
 const INSTANCE_COLS: &str = "game_instance_id, save_path, console_slug, paused, \
      last_synced_hash, last_synced_save_id, last_uploaded_hash, \
-     conflict_local_hash, conflict_remote_hash, conflict_detected_at";
+     conflict_local_hash, conflict_remote_hash, conflict_detected_at, content_path";
 
 const BACKUP_COLS: &str = "id, game_instance_id, original_path, content_hash, size_bytes, replaced_with, server_save_id, reason, overwritten_at";
 
@@ -200,6 +206,7 @@ fn map_instance(row: &Row) -> rusqlite::Result<InstanceRecord> {
         save_path: PathBuf::from(save_path),
         console_slug: row.get(2)?,
         paused: row.get(3)?,
+        content_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
         last_synced_hash: row.get(4)?,
         last_synced_save_id: row.get(5)?,
         last_uploaded_hash: row.get(6)?,
@@ -327,6 +334,13 @@ impl Store {
 
     pub fn set_paused(&self, id: &str, paused: bool) -> rusqlite::Result<()> {
         self.conn.execute("UPDATE instances SET paused = ?2 WHERE game_instance_id = ?1", params![id, paused])?;
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the ROM / content file this instance launches
+    /// with. See `[launchers]` in config for the emulator side.
+    pub fn set_content_path(&self, id: &str, path: Option<&Path>) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE instances SET content_path = ?2 WHERE game_instance_id = ?1", params![id, path.map(|p| p.to_string_lossy().into_owned())])?;
         Ok(())
     }
 

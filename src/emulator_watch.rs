@@ -4,9 +4,11 @@
 //! (force-push, which is what makes `[sync].upload_trigger = "on-emulator-exit"`
 //! actually mean something).
 //!
-//! There is nothing here about ROMs or launch commands - which save file belongs
-//! to which game already comes from the path <-> instance mapping. This is a
-//! coarse "an emulator's state changed, re-check everything" signal.
+//! There is nothing here about ROMs - which save file belongs to which game
+//! already comes from the path <-> instance mapping. This is a coarse "an
+//! emulator's state changed, re-check everything" signal. The watched set is
+//! `[sync].emulators` plus every configured `[launchers]` command basename, so
+//! setting up a launcher also improves passive exit-sync for that emulator.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -52,9 +54,9 @@ fn run(control: &Sender<Control>, stop: &AtomicBool) {
     }
 }
 
-/// The subset of `[sync].emulators` whose process is running right now.
+/// The subset of the watched emulator set whose process is running right now.
 fn scan(sys: &mut System) -> HashSet<String> {
-    let wanted: Vec<String> = Config::get(|c| c.sync.emulators.iter().map(|e| stem(e)).collect());
+    let wanted: HashSet<String> = Config::get(|c| c.sync.emulators.iter().map(|e| stem(e)).chain(c.launchers.values().filter(|l| l.is_set()).map(|l| command_stem(&l.command))).collect());
     if wanted.is_empty() {
         return HashSet::new();
     }
@@ -71,6 +73,13 @@ fn scan(sys: &mut System) -> HashSet<String> {
         }
     }
     hits
+}
+
+/// Basename of a launcher `command` (which may be an absolute path), normalised
+/// the same way process names are.
+fn command_stem(cmd: &str) -> String {
+    let base = std::path::Path::new(cmd.trim()).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    stem(&base)
 }
 
 /// Lowercase, trailing extension stripped: `RetroArch.exe` -> `retroarch`,

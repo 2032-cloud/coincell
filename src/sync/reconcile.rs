@@ -109,6 +109,7 @@ mod tests {
             save_path: PathBuf::from("/saves/g.srm"),
             console_slug: None,
             paused: false,
+            content_path: None,
             last_synced_hash: synced.map(str::to_owned),
             last_synced_save_id: synced.map(|_| "save-x".to_owned()),
             last_uploaded_hash: None,

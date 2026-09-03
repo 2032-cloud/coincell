@@ -41,6 +41,7 @@ pub enum ConfigOutcome {
 enum Section {
     Account,
     Sync,
+    Emulators,
     Startup,
     Notifications,
     Appearance,
@@ -55,12 +56,14 @@ enum Section {
 
 impl Section {
     const DEFAULT: Section = Section::Account;
-    const RAIL: [Section; 8] = [Section::Account, Section::Sync, Section::Startup, Section::Notifications, Section::Appearance, Section::Updates, Section::Backups, Section::Advanced];
+    const RAIL: [Section; 9] =
+        [Section::Account, Section::Sync, Section::Emulators, Section::Startup, Section::Notifications, Section::Appearance, Section::Updates, Section::Backups, Section::Advanced];
 
     fn title(self) -> &'static str {
         match self {
             Section::Account => "Account",
             Section::Sync => "Sync",
+            Section::Emulators => "Emulators",
             Section::Startup => "Startup",
             Section::Notifications => "Notifications",
             Section::Appearance => "Appearance",
@@ -76,6 +79,7 @@ impl Section {
         match self {
             Section::Account => icons::USER,
             Section::Sync => icons::SYNC,
+            Section::Emulators => "\u{25B6}", // play triangle; swap for a Phosphor glyph if one's added
             Section::Startup => icons::ROCKET,
             Section::Notifications => icons::BELL,
             Section::Appearance => icons::PALETTE,
@@ -119,11 +123,22 @@ pub struct ConfigApp {
     info: Option<String>,
     backup_confirm: Option<BackupConfirm>,
     confirm_uninstall: bool,
+    /// Console slug whose emulator profile is open for editing, plus its draft.
+    emu_selected: Option<String>,
+    emu_draft: EmuDraft,
+}
+
+/// Editable copy of a `[launchers]` profile while the Emulators section has it open.
+#[derive(Default, Clone)]
+struct EmuDraft {
+    command: String,
+    args: Vec<String>,
 }
 
 impl ConfigApp {
     pub fn new() -> Self {
-        let mut app = Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None, info: None, backup_confirm: None, confirm_uninstall: false };
+        let mut app =
+            Self { section: Section::DEFAULT, drafts: Drafts::default(), error: None, info: None, backup_confirm: None, confirm_uninstall: false, emu_selected: None, emu_draft: EmuDraft::default() };
         app.reset();
         app
     }
@@ -136,6 +151,7 @@ impl ConfigApp {
         self.info = None;
         self.backup_confirm = None;
         self.confirm_uninstall = false;
+        self.emu_selected = None;
         self.drafts.api_base = Config::get(|c| c.advanced.api_base.to_string());
         self.drafts.emulators = Config::get(|c| c.sync.emulators.join("\n"));
     }
@@ -191,6 +207,7 @@ impl ConfigApp {
                             outcome = ConfigOutcome::SyncNow;
                         }
                     }
+                    Section::Emulators => self.emulators(ui, catalog),
                     Section::Startup => {
                         if let Some(o) = self.startup(ui) {
                             outcome = o;
@@ -347,6 +364,140 @@ impl ConfigApp {
         ui.add_space(2.0);
         ui.small("The engine also runs on the realtime stream and the poll interval above.");
         sync_now
+    }
+
+    /// Per-console emulator profiles (`[launchers]`). The console list is every
+    /// distinct console the account has a game for.
+    fn emulators(&mut self, ui: &mut egui::Ui, catalog: &[GameInstance]) {
+        ui.small("Give a console an emulator command and CoinCell's Home window gets a Play button for its games: it syncs the latest save, then runs the command with the game's ROM path appended (or wherever you drop the ROM-path token).");
+        ui.add_space(8.0);
+
+        let mut consoles: Vec<(&str, &str)> = catalog.iter().map(|g| (g.console_slug.as_str(), g.console_name.as_str())).collect();
+        consoles.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+        consoles.dedup();
+        if consoles.is_empty() {
+            ui.weak("Add a game first \u{2014} consoles you have games for show up here.");
+            return;
+        }
+
+        let api_base = Config::get(|c| c.advanced.api_base.to_string());
+        let configured: HashSet<String> = Config::get(|c| c.launchers.iter().filter(|(_, l)| l.is_set()).map(|(k, _)| k.clone()).collect());
+
+        ui.horizontal_wrapped(|ui| {
+            for (slug, name) in &consoles {
+                let selected = self.emu_selected.as_deref() == Some(*slug);
+                if console_chip(ui, &api_base, slug, name, configured.contains(*slug), selected).clicked() {
+                    if selected {
+                        self.emu_selected = None;
+                    } else {
+                        self.emu_selected = Some((*slug).to_owned());
+                        self.load_emu_draft(slug);
+                    }
+                }
+            }
+        });
+
+        let Some(slug) = self.emu_selected.clone() else { return };
+        let name = consoles.iter().find(|(s, _)| *s == slug).map_or(slug.as_str(), |(_, n)| n);
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new(format!("{name} emulator")).strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Command");
+                ui.add(egui::TextEdit::singleline(&mut self.emu_draft.command).hint_text("retroarch, or a full path").desired_width(ui.available_width()));
+            });
+
+            ui.add_space(8.0);
+            ui.label("Arguments");
+            ui.small("One per line, in order. The ROM-path token can go anywhere; without it the ROM is appended last.");
+            ui.add_space(2.0);
+
+            let mut remove = None;
+            let mut swap = None;
+            let n = self.emu_draft.args.len();
+            #[allow(clippy::needless_range_loop)] // need the index for the reorder / remove buttons
+            for i in 0..n {
+                ui.horizontal(|ui| {
+                    if self.emu_draft.args[i] == crate::config::CONTENT_TOKEN {
+                        ui.add_enabled_ui(false, |ui| ui.add(egui::TextEdit::singleline(&mut "\u{1F4C4} ROM path".to_owned()).desired_width(ui.available_width() - 78.0)));
+                    } else {
+                        ui.add(egui::TextEdit::singleline(&mut self.emu_draft.args[i]).desired_width(ui.available_width() - 78.0));
+                    }
+                    if ui.add_enabled(i > 0, egui::Button::new("\u{2191}").small()).clicked() {
+                        swap = Some((i, i - 1));
+                    }
+                    if ui.add_enabled(i + 1 < n, egui::Button::new("\u{2193}").small()).clicked() {
+                        swap = Some((i, i + 1));
+                    }
+                    if ui.button(egui::RichText::new("\u{2715}").small()).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.emu_draft.args.remove(i);
+            }
+            if let Some((a, b)) = swap {
+                self.emu_draft.args.swap(a, b);
+            }
+            if self.emu_draft.args.last().is_none_or(|s| !s.trim().is_empty()) {
+                self.emu_draft.args.push(String::new());
+            }
+
+            ui.add_space(2.0);
+            if ui.button("+ ROM path").on_hover_text("Insert the {content} token").clicked() {
+                let at = self.emu_draft.args.iter().rposition(|s| !s.trim().is_empty()).map_or(0, |p| p + 1);
+                self.emu_draft.args.insert(at, crate::config::CONTENT_TOKEN.to_owned());
+            }
+
+            let profile = self.drafted_profile();
+            if profile.is_set() {
+                ui.add_space(6.0);
+                ui.small(egui::RichText::new(format!("Runs:  {}", profile.argv("<rom>").join(" "))).weak());
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    let p = profile.clone();
+                    let key = slug.clone();
+                    let r = Config::update(|c| {
+                        if p.is_set() {
+                            c.launchers.insert(key, p);
+                        } else {
+                            c.launchers.remove(&key);
+                        }
+                    });
+                    self.note_save(r);
+                    self.load_emu_draft(&slug);
+                }
+                if ui.button("Revert").clicked() {
+                    self.load_emu_draft(&slug);
+                }
+                if configured.contains(slug.as_str()) && ui.button(egui::RichText::new("Remove").color(ui.visuals().error_fg_color)).clicked() {
+                    let key = slug.clone();
+                    let r = Config::update(|c| {
+                        c.launchers.remove(&key);
+                    });
+                    self.note_save(r);
+                    self.emu_draft = EmuDraft::default();
+                    self.emu_draft.args.push(String::new());
+                }
+            });
+        });
+    }
+
+    /// Load the draft from the saved profile for `slug` (or a blank one).
+    fn load_emu_draft(&mut self, slug: &str) {
+        let mut d = Config::get(|c| c.launchers.get(slug).cloned()).map(|l| EmuDraft { command: l.command, args: l.args }).unwrap_or_default();
+        d.args.push(String::new()); // trailing blank row to type into
+        self.emu_draft = d;
+    }
+
+    /// The draft as a `LauncherProfile`, blanks stripped.
+    fn drafted_profile(&self) -> crate::config::LauncherProfile {
+        crate::config::LauncherProfile { command: self.emu_draft.command.trim().to_owned(), args: self.emu_draft.args.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect() }
     }
 
     fn startup(&mut self, ui: &mut egui::Ui) -> Option<ConfigOutcome> {
@@ -760,6 +911,32 @@ fn scale_combo(ui: &mut egui::Ui, value: &mut f32) -> bool {
         }
     });
     changed
+}
+
+/// A small selectable console card (box art + name + configured badge) for the
+/// Emulators section, echoing the add-game console picker.
+fn console_chip(ui: &mut egui::Ui, api_base: &str, slug: &str, name: &str, is_set: bool, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(96.0, 118.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter().clone();
+        painter.rect_filled(rect, 6.0, if selected { ui.visuals().selection.bg_fill } else { ui.visuals().faint_bg_color });
+        let art = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(80.0, 72.0));
+        let url = format!("{}/api/consoles/{}/box_art.png", api_base.trim_end_matches('/'), slug);
+        egui::Image::new(url).show_loading_spinner(false).corner_radius(4.0).paint_at(ui, art);
+        let strip = egui::Rect::from_min_max(egui::pos2(rect.min.x + 6.0, art.max.y + 3.0), rect.max - egui::vec2(4.0, 3.0));
+        let mut s = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Min)));
+        s.spacing_mut().item_spacing.y = 0.0;
+        s.add(egui::Label::new(egui::RichText::new(name).size(10.5)).truncate());
+        if is_set {
+            s.colored_label(OK_GREEN, egui::RichText::new("\u{2713} set").size(9.5));
+        } else {
+            s.weak(egui::RichText::new("not set").size(9.5));
+        }
+        if resp.hovered() {
+            painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color), egui::StrokeKind::Inside);
+        }
+    }
+    resp
 }
 
 /// Renders an "are you sure?" body. `Some(true)` = confirmed, `Some(false)` =

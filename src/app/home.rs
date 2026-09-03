@@ -10,7 +10,7 @@
 //! instances are mapped comes from the `data.sqlite` store, cached here and
 //! refreshed on [`HomeApp::reset`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -21,7 +21,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use crate::api::{Branding, Client, Console, Game, GameInstance, NewGameInstance, SaveMeta};
 use crate::app::mapping::{self, PickedSave};
 use crate::app::{icons, open_path};
-use crate::config::ConflictPolicy;
+use crate::config::{Config, ConflictPolicy};
 use crate::store::{InstanceRecord, SaveBackup, Store};
 use crate::sync::{Action, LocalFile, RestoreSource, humanize_since, reconcile};
 use crate::theme::homepage_path;
@@ -35,6 +35,8 @@ pub struct HomeView<'a> {
     pub api_base: &'a str,
     pub branding: &'a Branding,
     pub client: &'a Client,
+    /// What the launcher is doing right now, for the Play buttons.
+    pub launch: LaunchStatus<'a>,
 }
 
 pub enum HomeOutcome {
@@ -66,6 +68,36 @@ pub enum HomeOutcome {
         instance_id: String,
         source: RestoreSource,
     },
+    /// Play button pressed: `App` runs the pre-launch sync, then the emulator.
+    Play {
+        instance_id: String,
+    },
+    /// "Choose…" next to the launch content path: pick the ROM, don't launch.
+    PickContent {
+        instance_id: String,
+    },
+    /// Confirmed Stop: `App` kills the launched emulator.
+    StopEmulator,
+}
+
+/// What `App`'s launcher is doing, so Home can render each Play button.
+#[derive(Clone, Copy, Default)]
+pub enum LaunchStatus<'a> {
+    #[default]
+    Idle,
+    /// Pre-launch sync running for this instance.
+    Checking(&'a str),
+    /// This instance's emulator is running.
+    Running(&'a str),
+}
+
+impl<'a> LaunchStatus<'a> {
+    fn active(&self) -> Option<&'a str> {
+        match self {
+            LaunchStatus::Idle => None,
+            LaunchStatus::Checking(id) | LaunchStatus::Running(id) => Some(id),
+        }
+    }
 }
 
 enum Mode {
@@ -104,6 +136,8 @@ struct DetailState {
     console_sizes: Vec<u64>,
     pick: FilePick,
     confirm_unmap: bool,
+    /// Inline "Stop the emulator?" confirm is showing.
+    confirm_stop: bool,
 }
 
 /// The save-history screen: the instance's server saves plus its local
@@ -151,9 +185,9 @@ enum HistAction {
 pub struct HomeApp {
     mode: Mode,
     search: String,
-    /// `game_instance_id`s with a local save path bound. Refreshed on `reset()`
-    /// and after a successful map here.
-    mapped: HashSet<String>,
+    /// Bound instances by id (local save path, console, pause, content path).
+    /// Refreshed on `reset()` and after any bind / content-path change.
+    books: HashMap<String, InstanceRecord>,
     consoles: Option<Task<Vec<Console>>>,
     games: Option<Task<Vec<Game>>>,
     create: Option<Task<String>>,
@@ -162,9 +196,19 @@ pub struct HomeApp {
 
 impl HomeApp {
     pub fn new() -> Self {
-        let mut app = Self { mode: Mode::List, search: String::new(), mapped: HashSet::new(), consoles: None, games: None, create: None, error: None };
+        let mut app = Self { mode: Mode::List, search: String::new(), books: Default::default(), consoles: None, games: None, create: None, error: None };
         app.reset();
         app
+    }
+
+    /// Show a one-line error banner (a failed launch / content-path write).
+    pub fn note_error(&mut self, msg: String) {
+        self.error = Some(msg);
+    }
+
+    /// Re-read the bound-instance rows from the store (after App changed one).
+    pub fn refresh_instances(&mut self) {
+        self.reload_books();
     }
 
     /// Full reset: back to the list, everything cleared. Used on construction
@@ -176,7 +220,7 @@ impl HomeApp {
         self.games = None;
         self.create = None;
         self.error = None;
-        self.reload_mapped();
+        self.reload_books();
     }
 
     /// Called when Home becomes the visible screen. Like [`Self::reset`], but
@@ -190,18 +234,18 @@ impl HomeApp {
             _ => false,
         };
         if keep {
-            self.reload_mapped();
+            self.reload_books();
         } else {
             self.reset();
         }
     }
 
-    fn reload_mapped(&mut self) {
-        self.mapped = match Store::get(|s| s.instances()) {
-            Ok(rows) => rows.into_iter().map(|r| r.game_instance_id).collect(),
+    fn reload_books(&mut self) {
+        self.books = match Store::get(|s| s.instances()) {
+            Ok(rows) => rows.into_iter().map(|r| (r.game_instance_id.clone(), r)).collect(),
             Err(e) => {
                 tracing::warn!("home: reading bound instances: {e:#}");
-                HashSet::new()
+                Default::default()
             }
         };
     }
@@ -252,6 +296,11 @@ impl HomeApp {
         });
         ui.add_space(6.0);
 
+        if let Some(err) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, err);
+            ui.add_space(6.0);
+        }
+
         if !view.ready {
             centered_spinner(ui, "Loading your games…");
             return next;
@@ -273,9 +322,13 @@ impl HomeApp {
                     if !unmapped.is_empty() {
                         heading(ui, "Mapped", mapped.len());
                     }
-                    let cards: Vec<_> = mapped.iter().map(|i| instance_card(i, view.api_base, true)).collect();
-                    if let Some(i) = render_grid(ui, &cards) {
+                    let cards: Vec<_> = mapped.iter().map(|i| instance_card(i, view.api_base, true, play_badge(i, view))).collect();
+                    let hit = render_grid(ui, &cards);
+                    if let Some(i) = hit.opened {
                         opened = Some(mapped[i].id.clone());
+                    }
+                    if let Some(i) = hit.played {
+                        *outcome = HomeOutcome::Play { instance_id: mapped[i].id.clone() };
                     }
                     ui.add_space(14.0);
                 }
@@ -283,8 +336,8 @@ impl HomeApp {
                     if !mapped.is_empty() {
                         heading(ui, "Not mapped", unmapped.len());
                     }
-                    let cards: Vec<_> = unmapped.iter().map(|i| instance_card(i, view.api_base, false)).collect();
-                    if let Some(i) = render_grid(ui, &cards) {
+                    let cards: Vec<_> = unmapped.iter().map(|i| instance_card(i, view.api_base, false, None)).collect();
+                    if let Some(i) = render_grid(ui, &cards).opened {
                         opened = Some(unmapped[i].id.clone());
                     }
                 }
@@ -294,7 +347,7 @@ impl HomeApp {
 
         if let Some(id) = opened {
             let console_sizes = view.catalog.iter().find(|g| g.id == id).and_then(|g| Store::get(|s| s.console_sizes(&g.console_slug)).ok().flatten()).unwrap_or_default();
-            return Mode::Detail(DetailState { instance_id: id, console_sizes, pick: FilePick::default(), confirm_unmap: false });
+            return Mode::Detail(DetailState { instance_id: id, console_sizes, pick: FilePick::default(), confirm_unmap: false, confirm_stop: false });
         }
         next
     }
@@ -318,7 +371,7 @@ impl HomeApp {
         let mut mapped = Vec::new();
         let mut unmapped = Vec::new();
         for (inst, _) in scored {
-            if self.mapped.contains(&inst.id) { mapped.push(inst) } else { unmapped.push(inst) }
+            if self.books.contains_key(&inst.id) { mapped.push(inst) } else { unmapped.push(inst) }
         }
         (mapped, unmapped)
     }
@@ -342,7 +395,7 @@ impl HomeApp {
                     empty_state(ui, view.branding, &format!("No consoles match “{query}”."), None);
                 } else {
                     let cards: Vec<_> = shown.iter().map(|c| CardData::plain(&c.slug, &c.name, &c.description, c.box_art_url.clone())).collect();
-                    if let Some(i) = render_grid(ui, &cards) {
+                    if let Some(i) = render_grid(ui, &cards).opened {
                         chosen = Some(shown[i].clone());
                     }
                 }
@@ -396,7 +449,7 @@ impl HomeApp {
                     empty_state(ui, view.branding, &format!("No games match “{query}”."), None);
                 } else {
                     let cards: Vec<_> = shown.iter().map(|g| CardData::plain(&g.slug, &g.name, &g.description, g.box_art_url.clone())).collect();
-                    if let Some(i) = render_grid_virtual(ui, &cards) {
+                    if let Some(i) = render_grid_virtual(ui, &cards).opened {
                         chosen = Some(shown[i].clone());
                     }
                 }
@@ -497,7 +550,7 @@ impl HomeApp {
                     game_name.trim().to_owned()
                 };
                 self.create = None;
-                self.reload_mapped();
+                self.reload_books();
                 return Mode::MapPrompt(MapPrompt { instance_id: id, console, label, pick: FilePick::default() });
             }
             Polled::Running | Polled::None => {}
@@ -617,11 +670,72 @@ impl HomeApp {
                     &mut self.error,
                     outcome,
                 ) {
-                    self.reload_mapped();
+                    self.reload_books();
                     state.pick = FilePick::default();
                 }
             }
             Some(b) => {
+                let launchable = has_launcher(&inst.console_slug);
+                let this_active = view.launch.active() == Some(state.instance_id.as_str());
+                ui.horizontal(|ui| match view.launch {
+                    LaunchStatus::Running(_) if this_active => {
+                        if state.confirm_stop {
+                            ui.label("Force stop the emulator? ");
+                            if ui.button("Cancel").clicked() {
+                                state.confirm_stop = false;
+                            }
+                            if ui.button(egui::RichText::new("Stop").color(ui.visuals().error_fg_color)).clicked() {
+                                state.confirm_stop = false;
+                                *outcome = HomeOutcome::StopEmulator;
+                            }
+                        } else if ui.button("\u{25A0}  Stop").clicked() {
+                            state.confirm_stop = true;
+                        }
+                    }
+                    LaunchStatus::Checking(_) if this_active => {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Checking for a newer save…");
+                    }
+                    _ => {
+                        state.confirm_stop = false;
+                        let other = view.launch.active().filter(|id| *id != state.instance_id);
+                        let mut btn = ui.add_enabled(launchable && other.is_none(), egui::Button::new("\u{25B6}  Play"));
+                        if !launchable {
+                            btn = btn.on_hover_text(format!("Set up an emulator for {} in Settings \u{203a} Emulators", inst.console_name));
+                        } else if let Some(id) = other {
+                            let name = view.catalog.iter().find(|g| g.id == id).map_or("another game", |g| g.name.as_str());
+                            btn = btn.on_hover_text(format!("Close {name} first"));
+                        }
+                        if btn.clicked() {
+                            *outcome = HomeOutcome::Play { instance_id: state.instance_id.clone() };
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Content file:");
+                    match &b.content_path {
+                        Some(p) => {
+                            ui.monospace(p.display().to_string());
+                        }
+                        None => {
+                            ui.weak("not set");
+                        }
+                    }
+                    if ui.button(if b.content_path.is_some() { "Change\u{2026}" } else { "Choose\u{2026}" }).clicked() {
+                        *outcome = HomeOutcome::PickContent { instance_id: state.instance_id.clone() };
+                    }
+                });
+                ui.small(if launchable {
+                    format!("Emulator: the {} profile in Settings \u{203a} Emulators.", inst.console_name)
+                } else {
+                    format!("No emulator profile for {} yet \u{2014} add one in Settings \u{203a} Emulators.", inst.console_name)
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("Local file:");
                     ui.monospace(b.save_path.display().to_string());
@@ -655,7 +769,7 @@ impl HomeApp {
                         if ui.button(egui::RichText::new("Really unmap").color(ui.visuals().error_fg_color)).clicked() {
                             match Store::write(|s| s.unbind_instance(&state.instance_id)) {
                                 Ok(()) => {
-                                    self.reload_mapped();
+                                    self.reload_books();
                                     state.confirm_unmap = false;
                                     *outcome = HomeOutcome::RecheckInstance { instance_id: state.instance_id.clone() };
                                 }
@@ -697,7 +811,7 @@ impl HomeApp {
             ui.weak(format!("· {title}"));
         });
         if back {
-            return Mode::Detail(DetailState { instance_id: state.instance_id, console_sizes: state.console_sizes, pick: FilePick::default(), confirm_unmap: false });
+            return Mode::Detail(DetailState { instance_id: state.instance_id, console_sizes: state.console_sizes, pick: FilePick::default(), confirm_unmap: false, confirm_stop: false });
         }
         ui.separator();
         ui.add_space(6.0);
@@ -885,7 +999,7 @@ impl HomeApp {
         self.consoles = None;
         self.games = None;
         self.create = None;
-        self.reload_mapped();
+        self.reload_books();
     }
 
     /// Result of an off-thread picker `App` ran for us. `None` = cancelled.
@@ -1157,6 +1271,19 @@ impl<T: Send + 'static> Task<T> {
 
 // ---- card + grid ------------------------------------------------------
 
+/// The launch affordance overlaid on a mapped card's art.
+#[derive(Clone, Copy, PartialEq)]
+enum PlayBadge {
+    /// Green ▶, click launches.
+    Ready,
+    /// Grey ▶: no emulator profile for this console, or another game is running.
+    Blocked,
+    /// Spinner while the pre-launch sync runs.
+    Checking,
+    /// Red ■: this game's emulator is up (click the card to reach Stop).
+    Running,
+}
+
 struct CardData {
     title: String,
     subtitle: String,
@@ -1164,18 +1291,40 @@ struct CardData {
     key: String,
     dot: Option<egui::Color32>,
     hover: String,
+    play: Option<PlayBadge>,
 }
 
 impl CardData {
     fn plain(key: &str, title: &str, subtitle: &str, art_url: String) -> Self {
-        Self { title: title.to_owned(), subtitle: subtitle.to_owned(), art_url, key: key.to_owned(), dot: None, hover: title.to_owned() }
+        Self { title: title.to_owned(), subtitle: subtitle.to_owned(), art_url, key: key.to_owned(), dot: None, hover: title.to_owned(), play: None }
     }
 }
 
-fn instance_card(inst: &GameInstance, api_base: &str, mapped: bool) -> CardData {
+/// What the play overlay does when clicked.
+struct CardHit {
+    resp: egui::Response,
+    /// A `Ready` play badge was clicked (launch this instance).
+    play_clicked: bool,
+}
+
+/// Whether this console has a usable emulator profile.
+fn has_launcher(slug: &str) -> bool {
+    Config::get(|c| c.launchers.get(slug).is_some_and(|l| l.is_set()))
+}
+
+/// The play badge for a mapped card, given what the launcher is doing.
+fn play_badge(inst: &GameInstance, view: &HomeView<'_>) -> Option<PlayBadge> {
+    match view.launch.active() {
+        Some(id) if id == inst.id => Some(if matches!(view.launch, LaunchStatus::Running(_)) { PlayBadge::Running } else { PlayBadge::Checking }),
+        Some(_) => has_launcher(&inst.console_slug).then_some(PlayBadge::Blocked),
+        None => has_launcher(&inst.console_slug).then_some(PlayBadge::Ready),
+    }
+}
+
+fn instance_card(inst: &GameInstance, api_base: &str, mapped: bool, play: Option<PlayBadge>) -> CardData {
     let dot = Some(if mapped { egui::Color32::from_rgb(0x3f, 0xb9, 0x50) } else { egui::Color32::from_rgb(0xd0, 0x9a, 0x2a) });
     let hover = if mapped { display_title(inst).to_owned() } else { format!("{}, not mapped to a local save yet", display_title(inst)) };
-    CardData { title: display_title(inst).to_owned(), subtitle: subtitle(inst), art_url: box_art_url(api_base, inst), key: inst.id.clone(), dot, hover }
+    CardData { title: display_title(inst).to_owned(), subtitle: subtitle(inst), art_url: box_art_url(api_base, inst), key: inst.id.clone(), dot, hover, play }
 }
 
 const CARD_GAP: f32 = 8.0;
@@ -1186,16 +1335,29 @@ fn card_width(ui: &egui::Ui) -> f32 {
     ((ui.available_width() - CARD_GAP - 1.0) / 2.0).floor().max(90.0)
 }
 
-/// One grid row (up to two cards); sets `clicked` to the flat index if hit.
-fn card_row(ui: &mut egui::Ui, row: usize, chunk: &[CardData], card_w: f32, clicked: &mut Option<usize>) {
+/// What a grid returned: the flat index of the card whose body was clicked, and
+/// of the card whose `Ready` play badge was clicked.
+#[derive(Default)]
+struct GridHit {
+    opened: Option<usize>,
+    played: Option<usize>,
+}
+
+/// One grid row (up to two cards); records the flat index for a body click and
+/// for a play-badge click.
+fn card_row(ui: &mut egui::Ui, row: usize, chunk: &[CardData], card_w: f32, hit: &mut GridHit) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for (col, data) in chunk.iter().enumerate() {
             if col > 0 {
                 ui.add_space(CARD_GAP);
             }
-            if card(ui, data, card_w).clicked() {
-                *clicked = Some(row * 2 + col);
+            let CardHit { resp, play_clicked } = card(ui, data, card_w);
+            let idx = row * 2 + col;
+            if play_clicked {
+                hit.played = Some(idx);
+            } else if resp.clicked() {
+                hit.opened = Some(idx);
             }
         }
     });
@@ -1203,33 +1365,33 @@ fn card_row(ui: &mut egui::Ui, row: usize, chunk: &[CardData], card_w: f32, clic
 }
 
 /// Two-wide card grid, every row laid out. Fine for account-sized lists.
-fn render_grid(ui: &mut egui::Ui, cards: &[CardData]) -> Option<usize> {
+fn render_grid(ui: &mut egui::Ui, cards: &[CardData]) -> GridHit {
     let card_w = card_width(ui);
-    let mut clicked = None;
+    let mut hit = GridHit::default();
     for (row, chunk) in cards.chunks(2).enumerate() {
-        card_row(ui, row, chunk, card_w, &mut clicked);
+        card_row(ui, row, chunk, card_w, &mut hit);
     }
-    clicked
+    hit
 }
 
 /// Two-wide card grid, virtualized: builds its own vertical `ScrollArea` and
 /// only lays out rows near the viewport, so a 1500-entry catalog only touches
 /// (and only requests art for) what's on or just off screen.
-fn render_grid_virtual(ui: &mut egui::Ui, cards: &[CardData]) -> Option<usize> {
+fn render_grid_virtual(ui: &mut egui::Ui, cards: &[CardData]) -> GridHit {
     // `row_h` picks the visible range; it only has to be about right (card art
     // is re-measured per row inside). `card()`'s own visibility check is the
     // real gate on art requests.
     let row_h = card_art_h(card_width(ui)) + CARD_STRIP_H + CARD_GAP;
     let rows = cards.len().div_ceil(2);
-    let mut clicked = None;
+    let mut hit = GridHit::default();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows, |ui, range| {
         let card_w = card_width(ui);
         for row in range {
             let chunk = &cards[row * 2..((row + 1) * 2).min(cards.len())];
-            card_row(ui, row, chunk, card_w, &mut clicked);
+            card_row(ui, row, chunk, card_w, &mut hit);
         }
     });
-    clicked
+    hit
 }
 
 /// Card = box art (3:4) on top, a fixed info strip below.
@@ -1242,7 +1404,7 @@ fn card_art_h(width: f32) -> f32 {
     (width * 4.0 / 3.0).round()
 }
 
-fn card(ui: &mut egui::Ui, data: &CardData, width: f32) -> egui::Response {
+fn card(ui: &mut egui::Ui, data: &CardData, width: f32) -> CardHit {
     const RADIUS: f32 = 8.0;
     let art_h = card_art_h(width);
 
@@ -1251,7 +1413,7 @@ fn card(ui: &mut egui::Ui, data: &CardData, width: f32) -> egui::Response {
     // well outside the viewport. `expand2` widens the test vertically so cards
     // just below the fold still preload.
     if !ui.is_rect_visible(rect.expand2(egui::vec2(0.0, CARD_PREFETCH))) {
-        return resp;
+        return CardHit { resp, play_clicked: false };
     }
 
     let painter = ui.painter().clone();
@@ -1262,6 +1424,40 @@ fn card(ui: &mut egui::Ui, data: &CardData, width: f32) -> egui::Response {
     painter.rect_filled(art_rect, RADIUS, bg);
     painter.text(art_rect.center(), egui::Align2::CENTER_CENTER, initials, egui::FontId::proportional(20.0), egui::Color32::from_white_alpha(210));
     egui::Image::new(data.art_url.clone()).show_loading_spinner(false).corner_radius(RADIUS).paint_at(ui, art_rect);
+
+    // Launch overlay, bottom-right of the art. Only a `Ready` badge intercepts
+    // the click; the others are indicators and let the card open normally.
+    let mut play_clicked = false;
+    if let Some(badge) = data.play {
+        let d = 24.0;
+        let brect = egui::Rect::from_min_size(egui::pos2(art_rect.max.x - d - 6.0, art_rect.max.y - d - 6.0), egui::vec2(d, d));
+        let (bg, fg) = match badge {
+            PlayBadge::Ready => (egui::Color32::from_rgb(0x3f, 0xb9, 0x50), egui::Color32::WHITE),
+            PlayBadge::Running => (egui::Color32::from_rgb(0xc0, 0x39, 0x39), egui::Color32::WHITE),
+            PlayBadge::Blocked | PlayBadge::Checking => (egui::Color32::from_black_alpha(150), egui::Color32::from_white_alpha(140)),
+        };
+        painter.circle_filled(brect.center(), d / 2.0, bg);
+        match badge {
+            PlayBadge::Checking => {
+                ui.put(brect.shrink(4.0), egui::Spinner::new().size(d - 8.0));
+            }
+            PlayBadge::Running => {
+                painter.rect_filled(egui::Rect::from_center_size(brect.center(), egui::vec2(d * 0.34, d * 0.34)), 1.0, fg);
+            }
+            _ => {
+                let c = brect.center();
+                let s = d * 0.22;
+                painter.add(egui::Shape::convex_polygon(vec![egui::pos2(c.x - s * 0.7, c.y - s), egui::pos2(c.x - s * 0.7, c.y + s), egui::pos2(c.x + s, c.y)], fg, egui::Stroke::NONE));
+            }
+        }
+        if badge == PlayBadge::Ready {
+            let bresp = ui.interact(brect, resp.id.with("play"), egui::Sense::click());
+            if bresp.hovered() {
+                painter.circle_stroke(brect.center(), d / 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+            }
+            play_clicked = bresp.clicked();
+        }
+    }
 
     let strip = egui::Rect::from_min_max(egui::pos2(rect.min.x, art_rect.max.y), rect.max).shrink2(egui::vec2(8.0, 5.0));
     let mut strip_ui = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -1281,7 +1477,7 @@ fn card(ui: &mut egui::Ui, data: &CardData, width: f32) -> egui::Response {
     if resp.hovered() {
         painter.rect_stroke(rect, RADIUS, egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color), egui::StrokeKind::Inside);
     }
-    resp.on_hover_text(&data.hover)
+    CardHit { resp: resp.on_hover_text(&data.hover), play_clicked }
 }
 
 // ---- shared UI bits ------------------------------------------------

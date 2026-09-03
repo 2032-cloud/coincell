@@ -130,6 +130,14 @@ Two files, different lifecycles:
 
 - **`config.toml`** (exists) - user-set preferences + identity. Hand-editable.
   Already preserves unknown keys. Keep it small.
+
+> **Debug builds are isolated.** `constants::DIRS_APP` makes `ProjectDirs` use a
+> parallel `CoinCell-dbg` tree for `#[cfg(debug_assertions)]` builds, so config,
+> database, logs, art cache and save backups all land somewhere the real install
+> never sees. `IPC_NAME` also gets a `.dbg` suffix so a dev build runs alongside
+> the installed one instead of bailing as a secondary. `constants::seed_debug_dirs()`
+> (called first thing in `main`) copies the real `config.toml` + `data.sqlite`
+> (+ `-wal`) across on the first debug run - read-only on the real files.
 - **`data.sqlite`** (**BUILT** - `src/store.rs`; goes in `DATA_DIR` —
   `ProjectDirs::data_dir()`, deliberately separate from the config dir) —
   operational state the daemon owns, not meant to be hand-edited. Holds: path ↔
@@ -165,10 +173,12 @@ would be rewritten whole on every change and get awkward fast.
   `-wal` / `-shm` siblings) is moved to `data.bak[.N].sqlite` and rebuilt; if
   even that fails the daemon runs against an in-memory database rather than
   crashing.
-- Tables: `instances` (path ↔ id, pause, sync bookkeeping + conflict columns),
-  `upload_queue` (bytes snapshotted at enqueue, `UNIQUE(instance, hash)`,
-  `ON DELETE CASCADE` from `instances`), `console_save_sizes` (JSON `validSaveSizes`
-  cache), `meta` (k/v - holds the `sync_cursor`).
+- Tables: `instances` (path ↔ id, pause, `content_path` for the launcher, sync
+  bookkeeping + conflict columns), `upload_queue` (bytes snapshotted at enqueue,
+  `UNIQUE(instance, hash)`, `ON DELETE CASCADE` from `instances`),
+  `save_backups` (pre-overwrite snapshots, no cascade), `console_save_sizes`
+  (JSON `validSaveSizes` cache), `meta` (k/v - `sync_cursor`,
+  `last_update_check`). Migrations at v3 (`instances.content_path` was v2→v3).
 
 ## `config.toml` schema
 
@@ -218,6 +228,10 @@ on_update = "notify"          # "notify" | "download" | "install"
 
 [backups]
 retain = 25                   # pre-overwrite snapshots kept per game; 0 = keep all
+
+[launchers.snes]              # per-console emulator profile, keyed by console slug
+command = "retroarch"
+args = ["-L", "/…/snes9x_libretro.so", "{content}"]   # {content} -> the ROM path
 
 [advanced]
 api_base = "https://cr.2032.cloud"   # override for dev / self-host
@@ -270,7 +284,12 @@ Rail sections:
    cleared when the engine is dropped), plus `N waiting to upload` when
    `Store::queued_uploads()` is non-empty. Passed into `ConfigApp::ui` alongside
    `updater`.
-3. **Startup** - an **install / uninstall** block (see Install), launch on
+3. **Emulators** - per-console emulator profiles for the launcher (see
+   Launcher). A `console_chip` card per console the account has a game for
+   (`catalog` distinct consoles, box art like the add-game picker); selecting
+   one opens the command field + reorderable arg-row editor + a live "Runs: …"
+   preview. Save / Revert / Remove write `[launchers]`.
+4. **Startup** - an **install / uninstall** block (see Install), launch on
    login, start hidden, and (a stray `[window]` toggle that fits here better
    than its own section) **hide the window when it loses focus** =
    `window.hide_on_focus_loss`. `start_hidden` **is** honoured: `App` starts in
@@ -280,15 +299,15 @@ Rail sections:
    re-asserting is what actually keeps it hidden. The launch-on-login checkbox
    now calls `install::set_autostart` (HKCU Run value / `~/.config/autostart`
    `.desktop`); it only bites once CoinCell is installed.
-4. **Notifications** - master toggle + the four per-event toggles (disabled while
+5. **Notifications** - master toggle + the four per-event toggles (disabled while
    the master is off) + a **Send a test notification** button. These gate
    `notice::post`; delivery is real OS toasts via `src/toast.rs` (see
    Notifications).
-5. **Appearance** - theme (follow account / follow system / light / dark;
+6. **Appearance** - theme (follow account / follow system / light / dark;
    applied live via `src/theme.rs`, see Theme) and **UI scale**
    (`window.ui_scale`, a preset % combo). Scale is applied live too: `App::logic`
    pushes it to `ctx.set_zoom_factor` whenever it drifts from the stored value.
-6. **Updates** - current version (`version::VERSION`, resolved from git at build
+7. **Updates** - current version (`version::VERSION`, resolved from git at build
    time - see Versioning; a "development build" note shows when
    `!version::is_release()`), channel, check-automatically, on-update action, a
    **Check for updates** button + status line, a "last checked N ago" line, and a
@@ -297,7 +316,7 @@ Rail sections:
    checks on `[updates].check_interval` run too; `[updates].on_update` = `notify`
    posts a `Notice`, `download` pre-fetches + verifies the binary then posts the
    `Notice`, `install` auto-applies.
-7. **Save backups** - a **Keep per game** retention combo (`[backups].retain`,
+8. **Save backups** - a **Keep per game** retention combo (`[backups].retain`,
    presets 10 / 25 / 50 / 100 / keep-all; lowering it runs
    `Store::prune_all_backups` immediately, unlinking freed blobs), then every
    pre-overwrite local snapshot the engine has kept (`Store::backups()`), newest
@@ -311,7 +330,7 @@ Rail sections:
    otherwise. Delete drops the index row and, if nothing else references the
    content-addressed blob (`Store::delete_backup` returns the now-orphaned hash),
    its file. Rail icon is `icons::RESTORE` (Phosphor clock-counter-clockwise).
-8. **Advanced** - log level (both it and the crash-reports toggle note "applies
+9. **Advanced** - log level (both it and the crash-reports toggle note "applies
    on restart"), crash-reports checkbox (shows "not answered yet" when the pref
    is absent), API base URL (commits on focus-loss, blank reverts),
    open-config-folder / open-data-folder / open-logs-folder / copy-diagnostics
@@ -628,7 +647,8 @@ worker thread owns both, drains the `SyncEvent`s and the debounced filesystem
 events, and does all the I/O. It talks to `App` over two channels: an
 `EngineEvent` mpsc out (`Hydrated { instances }` / `SaveAdvanced` for Home's
 catalog, plus `Status` / `Pulled` / `Pushed` / `Restored` / `PushPending` /
-`Conflict` / `Error` / `Stuck { instance_id, reason }` / `SessionExpired`), a
+`Conflict` / `Rechecked` (the pre-launch settle signal for the launcher) /
+`Error` / `Stuck { instance_id, reason }` / `SessionExpired`), a
 `Control` mpsc in (`SyncNow`, which
 polls **and** force-pushes + drains the queue; `Rehydrate` for Home's refresh
 button; `Recheck { instance_id }` after Home binds / pauses / unmaps;
@@ -818,11 +838,41 @@ editable list in Config › Sync. New dep: `sysinfo` (`system` feature only).
      filesystem filter driver (Windows) or FUSE (Linux), elevated install,
      per-OS. notify covers the write side; the read side is the launcher's job. -->
 
-**Launcher model (later, the clean endgame for "right before you play").** Let
-the user register their emulator command with coincell. Launching through
-coincell does: pull latest for that instance → exec emulator → on exit, push. No
-races. Falls back to process-watch (poll the process list for a configured
-emulator exe) for users who launch the emulator directly.
+### Launcher **[BUILT]**
+
+A scoped launcher: no ROM ⇄ save ⇄ emulator format-string triangle, just a
+per-console command + args and a per-instance content path.
+
+- **Config** (`[launchers]`, keyed by console slug): `LauncherProfile { command,
+  args: Vec<String> }`. `args` passes through verbatim except the literal token
+  `"{content}"` (`config::CONTENT_TOKEN`), which `LauncherProfile::argv(content)`
+  replaces with the instance's content path - appended last if the token is
+  absent. Edited in **Config › Emulators**: a card per console the account has a
+  game for (`catalog` distinct consoles, box art like the add-game picker), each
+  opening a command field + a reorderable arg-row list (`↑`/`↓`/`✕`, auto-blank
+  row, a **+ ROM path** button that inserts the token) and a live "Runs: …"
+  preview.
+- **Content path**: `instances.content_path` (store migration v3, nullable). Set
+  per game on the detail page's launch area (a `PickKind::Content` file pick).
+- **Play** (green ▶ overlay on a mapped Home card, and a button on the detail
+  page): `HomeOutcome::Play` → `App::begin_play`. If no content path yet, the
+  file picker opens first with launch-after wired through
+  (`PickKind::Content { launch_after: true }`). Otherwise `App` sends
+  `Control::Recheck`, shows a spinner (`Updater`-style `App::launch` state
+  machine: `Checking { deadline } → Running { child }`), and spawns the emulator
+  on `EngineEvent::Rechecked` for that instance (new event) or after a 3 s
+  deadline (offline). A `Conflict` for that instance **cancels** the launch and
+  surfaces the picker instead.
+- **Exit**: `App::tick_launch` polls `child.try_wait()`; on exit it clears
+  `App.launch` and sends `Control::Recheck` so the fresh save uploads promptly.
+  **■ Stop** on the detail page (confirm-guarded) hard-kills the child; the exit
+  path then reaps + syncs it.
+- **One game at a time**, tracked globally on `App.launch`. Other cards' Play
+  buttons grey out (`PlayBadge::Blocked`) while one runs. Quitting CoinCell (or
+  logging out) leaves the emulator running and just stops tracking it - the
+  startup hydrate reconciles anything saved in the meantime.
+- The launcher `command` basenames are folded into the emulator-watch set, so
+  configuring a launcher also improves passive exit-sync for that emulator.
 
 ### Conflict policy
 
@@ -1290,9 +1340,14 @@ None blocking. In rough build order:
    via the `ipc::acquire_wait` handoff); a `Staged` update is re-adopted on the
    next launch. Nothing left.
 8. **Emulator watch** - **BUILT** (`src/emulator_watch.rs`). `sysinfo` process
-   poll; start/exit of a `[sync].emulators` basename → `Control::SyncNow`. Covers
-   `on-emulator-exit` and the "pull right before you play" case without a real
-   launcher.
+   poll; start/exit of a `[sync].emulators` (or `[launchers]` command) basename →
+   `Control::SyncNow`. Covers `on-emulator-exit` and the "pull right before you
+   play" case even when the user launches the emulator directly.
+8b. **Launcher** - **BUILT** (see Sync engine › Launcher). Per-console
+   `[launchers]` profile + per-instance `content_path`; Play buttons in Home;
+   sync-check → spawn → poll for exit → sync. Left: a `{content_dir}` / `{save}`
+   token if an emulator needs one, and a Phosphor glyph for the Emulators rail
+   icon (a `▶` char stands in).
 9. **Backup retention** - **DONE**. `[backups].retain` (default 25, `0` = keep
    all); `Store::prune_backups` after each snapshot, `prune_all_backups` when the
    limit drops; Config › Save backups combo. (`pause_on_metered` was **dropped** -

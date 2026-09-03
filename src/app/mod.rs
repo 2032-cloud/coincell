@@ -4,6 +4,7 @@ mod home;
 mod icons;
 mod mapping;
 
+use std::process::Child;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -116,11 +117,34 @@ enum LoginIntent {
 }
 
 /// A native file picker (`rfd`) running on its own thread. While one is live the
-/// window won't auto-hide; the chosen path is handed back to `HomeApp` when it
-/// lands.
+/// window won't auto-hide; the chosen path is handed back when it lands.
 struct PendingPick {
     instance_id: String,
+    kind: PickKind,
     rx: Receiver<Option<std::path::PathBuf>>,
+}
+
+enum PickKind {
+    /// Pick the local save file to bind - routed to `HomeApp::deliver_save_pick`.
+    Save,
+    /// Pick the ROM / content file for the launcher. `launch_after` continues
+    /// straight into `begin_play` once it's set.
+    Content { launch_after: bool },
+}
+
+/// A game the user launched through CoinCell (one at a time).
+struct Launch {
+    instance_id: String,
+    phase: LaunchPhase,
+}
+
+enum LaunchPhase {
+    /// Pre-launch sync in flight; spawn the emulator on `EngineEvent::Rechecked`
+    /// for this instance, or when `deadline` passes (offline).
+    Checking { deadline: Instant },
+    /// Emulator running. `child` is polled with `try_wait` each tick and killed
+    /// on a confirmed Stop.
+    Running { child: Child },
 }
 
 pub struct App {
@@ -179,6 +203,9 @@ pub struct App {
     /// The sync engine's last reported stream connectivity, for the Config ›
     /// Sync status line. `None` while no engine is running.
     stream_online: Option<Status>,
+    /// A game launched through CoinCell's per-console emulator profiles. One at
+    /// a time; `None` when nothing is running or being checked.
+    launch: Option<Launch>,
 }
 
 impl App {
@@ -227,6 +254,7 @@ impl App {
             auto_check_pending: false,
             notify_when_staged: false,
             stream_online: None,
+            launch: None,
         }
     }
 
@@ -258,6 +286,12 @@ impl App {
             return;
         };
         let mut session_expired = false;
+        let mut launch_ready: Option<String> = None;
+        let mut launch_cancel = false;
+        let checking = match &self.launch {
+            Some(Launch { instance_id, phase: LaunchPhase::Checking { .. } }) => Some(instance_id.clone()),
+            _ => None,
+        };
         for event in engine.events() {
             match event {
                 EngineEvent::Hydrated { instances } => {
@@ -286,7 +320,15 @@ impl App {
                 EngineEvent::PushPending { instance_id } => tracing::debug!("{instance_id}: local change waiting (manual upload)"),
                 EngineEvent::Conflict { instance_id } => {
                     tracing::warn!("{instance_id}: conflict, resolve in Home");
+                    if checking.as_deref() == Some(instance_id.as_str()) {
+                        launch_cancel = true; // don't play into an unresolved conflict
+                    }
                     notice::post(Notice::Conflict { game: self.game_label(&instance_id) });
+                }
+                EngineEvent::Rechecked { instance_id } => {
+                    if checking.as_deref() == Some(instance_id.as_str()) {
+                        launch_ready = Some(instance_id);
+                    }
                 }
                 // Transient/internal errors stay in the log; only a wedged
                 // instance (`Stuck`) is worth interrupting the user for.
@@ -308,6 +350,11 @@ impl App {
         if session_expired {
             self.handle_session_expired(ctx);
         }
+        if launch_cancel {
+            self.launch = None;
+        } else if let Some(id) = launch_ready {
+            self.spawn_emulator(&id);
+        }
     }
 
     /// A human name for an instance id, for notice text; the id itself if the
@@ -318,33 +365,136 @@ impl App {
 
     /// Spawn a native picker on its own thread (RFD inits COM per call, so any
     /// thread is fine). The window stops auto-hiding until it resolves.
-    fn open_save_dialog(&mut self, ctx: &egui::Context, instance_id: String, title: String) {
+    fn open_pick(&mut self, ctx: &egui::Context, instance_id: String, kind: PickKind, title: String) {
         if self.pending_pick.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::Builder::new()
-            .name("save-file-dialog".into())
+            .name("file-dialog".into())
             .spawn(move || {
                 let _ = tx.send(mapping::pick_save_file(&title));
                 ctx.request_repaint();
             })
-            .expect("spawn save-file-dialog thread");
-        self.pending_pick = Some(PendingPick { instance_id, rx });
+            .expect("spawn file-dialog thread");
+        self.pending_pick = Some(PendingPick { instance_id, kind, rx });
     }
 
-    /// Hand a finished pick back to Home (`None` means the user cancelled). The
-    /// focus latch is re-armed: the native dialog held focus, and the OS can be
-    /// a frame or two returning it, which would otherwise read as a focus-loss
+    /// Hand a finished pick to its destination (`None` = cancelled). The focus
+    /// latch is re-armed: the native dialog held focus, and the OS can be a
+    /// frame or two returning it, which would otherwise read as a focus-loss
     /// auto-hide.
-    fn drain_pending_pick(&mut self) {
+    fn drain_pending_pick(&mut self, ctx: &egui::Context) {
         let Some(pending) = &self.pending_pick else { return };
         let Ok(result) = pending.rx.try_recv() else { return };
-        let instance_id = pending.instance_id.clone();
-        self.pending_pick = None;
+        let PendingPick { instance_id, kind, .. } = self.pending_pick.take().expect("checked just above");
         self.focus_latch = true;
-        self.home_app.deliver_save_pick(&instance_id, result);
+        match kind {
+            PickKind::Save => self.home_app.deliver_save_pick(&instance_id, result),
+            PickKind::Content { launch_after } => {
+                let Some(path) = result else { return };
+                if let Err(e) = Store::write(|s| s.set_content_path(&instance_id, Some(&path))) {
+                    self.home_app.note_error(format!("Couldn't save the content path: {e:#}"));
+                    return;
+                }
+                self.home_app.refresh_instances();
+                if launch_after {
+                    self.begin_play(ctx, instance_id);
+                }
+            }
+        }
+    }
+
+    /// The user pressed Play. Route to the content picker if no ROM is set yet,
+    /// else start the pre-launch sync check.
+    fn begin_play(&mut self, ctx: &egui::Context, instance_id: String) {
+        if self.launch.is_some() {
+            return; // one at a time; the button should already be disabled
+        }
+        let book = match Store::get(|s| s.instance(&instance_id)) {
+            Ok(Some(b)) => b,
+            _ => return self.home_app.note_error("That game isn't mapped to a save file.".into()),
+        };
+        let slug = self.catalog.iter().find(|g| g.id == instance_id).map(|g| g.console_slug.clone()).or(book.console_slug.clone());
+        let has_profile = slug.as_deref().is_some_and(|s| Config::get(|c| c.launchers.get(s).is_some_and(|l| l.is_set())));
+        if !has_profile {
+            return self.home_app.note_error("Set up an emulator for this console in Settings \u{203a} Emulators first.".into());
+        }
+        if book.content_path.is_none() {
+            let name = self.game_label(&instance_id);
+            self.open_pick(ctx, instance_id, PickKind::Content { launch_after: true }, format!("ROM / content file for {name}"));
+            return;
+        }
+        if let Some(engine) = &self.sync {
+            engine.recheck(&instance_id);
+        }
+        self.launch = Some(Launch { instance_id, phase: LaunchPhase::Checking { deadline: Instant::now() + Duration::from_secs(3) } });
+    }
+
+    /// Build the argv from the console's `[launchers]` profile and spawn the
+    /// emulator. Called once the pre-launch check settles (or times out).
+    fn spawn_emulator(&mut self, instance_id: &str) {
+        let book = match Store::get(|s| s.instance(instance_id)) {
+            Ok(Some(b)) => b,
+            _ => {
+                self.launch = None;
+                return;
+            }
+        };
+        let Some(content) = book.content_path.as_ref() else {
+            self.launch = None;
+            return;
+        };
+        let slug = self.catalog.iter().find(|g| g.id == instance_id).map(|g| g.console_slug.clone()).or(book.console_slug.clone());
+        let Some(profile) = slug.as_deref().and_then(|s| Config::get(|c| c.launchers.get(s).cloned())).filter(|p| p.is_set()) else {
+            self.launch = None;
+            return self.home_app.note_error("No emulator is configured for this console any more.".into());
+        };
+        let argv = profile.argv(&content.to_string_lossy());
+        tracing::info!("launching {instance_id}: {argv:?}");
+        match std::process::Command::new(&argv[0]).args(&argv[1..]).spawn() {
+            Ok(child) => self.launch = Some(Launch { instance_id: instance_id.to_owned(), phase: LaunchPhase::Running { child } }),
+            Err(e) => {
+                self.launch = None;
+                self.home_app.note_error(format!("Couldn't start {}: {e}", argv[0]));
+            }
+        }
+    }
+
+    /// Advance the launcher: fire the pre-launch spawn on timeout, and clear +
+    /// resync when a launched emulator exits.
+    fn tick_launch(&mut self, ctx: &egui::Context) {
+        let Some(launch) = &mut self.launch else { return };
+        match &mut launch.phase {
+            LaunchPhase::Checking { deadline } => {
+                if Instant::now() >= *deadline {
+                    let id = launch.instance_id.clone();
+                    self.spawn_emulator(&id);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+            }
+            LaunchPhase::Running { child } => match child.try_wait() {
+                Ok(None) => ctx.request_repaint_after(Duration::from_secs(1)),
+                _ => {
+                    let id = launch.instance_id.clone();
+                    tracing::info!("emulator for {id} exited; syncing");
+                    self.launch = None;
+                    if let Some(engine) = &self.sync {
+                        engine.recheck(&id);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Confirmed Stop from the detail page: hard-kill the emulator, then let the
+    /// normal exit path (`tick_launch`) reap it and push the save.
+    fn stop_emulator(&mut self) {
+        if let Some(Launch { phase: LaunchPhase::Running { child }, .. }) = &mut self.launch {
+            let _ = child.kill();
+        }
     }
 
     /// Pick up an update a previous session downloaded but never committed:
@@ -565,6 +715,8 @@ impl App {
         self.auto_check_pending = false;
         self.notify_when_staged = false;
         self.updater = Updater::Idle;
+        // Stop tracking any launched emulator; leave it running.
+        self.launch = None;
         self.account_theme = None;
         self.config_app.reset();
         self.home_app.reset();
@@ -968,7 +1120,8 @@ impl eframe::App for App {
         self.pump_auth(ctx);
         self.drain_sync(ctx);
         notice::pump();
-        self.drain_pending_pick();
+        self.drain_pending_pick(ctx);
+        self.tick_launch(ctx);
         self.tick_update_check(ctx);
         self.drain_updater(ctx);
         self.sync_shown_screen();
@@ -1048,7 +1201,12 @@ impl eframe::App for App {
             } else if self.state.is_home()
                 && let Some(client) = api_client()
             {
-                let home = HomeView { catalog: &self.catalog, ready: self.catalog_ready, api_base: &self.device_config.api_base, branding: &self.branding, client: &client };
+                let launch = match &self.launch {
+                    None => home::LaunchStatus::Idle,
+                    Some(Launch { instance_id, phase: LaunchPhase::Checking { .. } }) => home::LaunchStatus::Checking(instance_id),
+                    Some(Launch { instance_id, phase: LaunchPhase::Running { .. } }) => home::LaunchStatus::Running(instance_id),
+                };
+                let home = HomeView { catalog: &self.catalog, ready: self.catalog_ready, api_base: &self.device_config.api_base, branding: &self.branding, client: &client, launch };
                 match self.home_app.ui(ui, frame, home) {
                     HomeOutcome::Stay => {}
                     HomeOutcome::Refresh => {
@@ -1073,13 +1231,19 @@ impl eframe::App for App {
                         }
                     }
                     HomeOutcome::OpenSaveDialog { instance_id, title } => {
-                        self.open_save_dialog(ui.ctx(), instance_id, title);
+                        self.open_pick(ui.ctx(), instance_id, PickKind::Save, title);
                     }
                     HomeOutcome::Restore { instance_id, source } => {
                         if let Some(engine) = &self.sync {
                             engine.restore(&instance_id, source);
                         }
                     }
+                    HomeOutcome::Play { instance_id } => self.begin_play(ui.ctx(), instance_id),
+                    HomeOutcome::PickContent { instance_id } => {
+                        let name = self.game_label(&instance_id);
+                        self.open_pick(ui.ctx(), instance_id, PickKind::Content { launch_after: false }, format!("ROM / content file for {name}"));
+                    }
+                    HomeOutcome::StopEmulator => self.stop_emulator(),
                 }
             }
         } else {

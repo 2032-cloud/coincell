@@ -33,6 +33,11 @@ fn main() -> anyhow::Result<()> {
     // whole process before any TLS happens.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Debug builds keep their state in a parallel `CoinCell-dbg` tree; on the
+    // first run, clone the real config + database in. No-op in release. Must
+    // precede any `Config::init` / `Store::init`.
+    constants::seed_debug_dirs();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 

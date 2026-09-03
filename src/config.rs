@@ -324,6 +324,47 @@ impl Default for BackupSettings {
     }
 }
 
+/// How to launch a game for one console. Keyed by console slug under
+/// `[launchers]`. `command` is the emulator binary; `args` is passed through
+/// verbatim except for the literal token `"{content}"`, which is replaced with
+/// the instance's content path (appended to the end if the token is absent).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherProfile {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+/// The placeholder in [`LauncherProfile::args`] that expands to the launched
+/// game's content path.
+pub const CONTENT_TOKEN: &str = "{content}";
+
+impl LauncherProfile {
+    /// `true` once there's a command to run.
+    pub fn is_set(&self) -> bool {
+        !self.command.trim().is_empty()
+    }
+
+    /// The full argv (command first) for launching `content`. `{content}` tokens
+    /// are substituted; if there were none, `content` is appended last.
+    pub fn argv(&self, content: &str) -> Vec<String> {
+        let mut out = vec![self.command.clone()];
+        let mut placed = false;
+        for a in &self.args {
+            if a == CONTENT_TOKEN {
+                out.push(content.to_owned());
+                placed = true;
+            } else {
+                out.push(a.clone());
+            }
+        }
+        if !placed {
+            out.push(content.to_owned());
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Advanced {
@@ -362,6 +403,9 @@ pub struct Config {
     pub window: WindowRules,
     pub updates: Updates,
     pub backups: BackupSettings,
+    /// Per-console emulator launch profiles, keyed by console slug.
+    #[serde(default)]
+    pub launchers: std::collections::HashMap<String, LauncherProfile>,
     pub advanced: Advanced,
 }
 
